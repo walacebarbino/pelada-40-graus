@@ -1,116 +1,151 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-import uuid
-import mercadopago
-from backend.database import init_db, get_connection
+import streamlit as st
+import requests
 
-app = FastAPI(title="Pelada 40º API")
+# URL para testes locais. Quando for enviar pro GitHub/Render, mantenha o link do Render.
+API_URL = "http://127.0.0.1:8000"
 
-# Inicializa as tabelas do banco ao subir a aplicação
-init_db()
+st.set_page_config(page_title="Pelada 40º", page_icon="⚽", layout="centered")
 
-# SDK Mercado Pago (coloque sua Access Token de teste aqui se desejar)
-sdk = mercadopago.SDK("SUA_ACCESS_TOKEN_TESTE")
+st.title("⚽ Pelada 40º")
+st.subheader("Garanta sua vaga na partida de 40 minutos!")
 
-class ReservaRequest(BaseModel):
-    partida_id: int
-    nome_jogador: str
+# Criando as 3 abas
+tab_reserva, tab_lista, tab_admin = st.tabs(["📅 Fazer Reserva", "📜 Lista de Participantes", "⚙️ Sala de Controle (Admin)"])
 
-@app.get("/")
-def home():
-    return {"status": "API Pelada 40º rodando com SQLite!"}
-
-@app.get("/partidas")
-def listar_partidas():
-    conn = get_connection()
-    cursor = conn.cursor()
-    
-    cursor.execute("SELECT * FROM partidas")
-    partidas = cursor.fetchall()
-    
-    resultado = []
-    for p in partidas:
-        # Conta quantas reservas já foram feitas para essa partida
-        cursor.execute("SELECT COUNT(*) FROM reservas WHERE partida_id = ?", (p["id"],))
-        reservas_feitas = cursor.fetchone()[0]
-        vagas_livres = p["vagas_totais"] - reservas_feitas
-        
-        resultado.append({
-            "id": p["id"],
-            "horario": p["horario"],
-            "vagas_totais": p["vagas_totais"],
-            "vagas_livres": max(0, vagas_livres),
-            "preco": p["preco"]
-        })
-        
-    conn.close()
-    return resultado
-
-@app.post("/reservar")
-def fazer_reserva(reserva: ReservaRequest):
-    conn = get_connection()
-    cursor = conn.cursor()
-    
-    # Verifica a partida
-    cursor.execute("SELECT * FROM partidas WHERE id = ?", (reserva.partida_id,))
-    partida = cursor.fetchone()
-    if not partida:
-        conn.close()
-        raise HTTPException(status_code=404, detail="Partida não encontrada")
-        
-    # Verifica vagas disponíveis
-    cursor.execute("SELECT COUNT(*) FROM reservas WHERE partida_id = ?", (reserva.partida_id,))
-    reservas_feitas = cursor.fetchone()[0]
-    if reservas_feitas >= partida["vagas_totais"]:
-        conn.close()
-        raise HTTPException(status_code=400, detail="Sem vagas disponíveis para este horário")
-    
-    # Gera cobrança PIX via Mercado Pago
-    payment_data = {
-        "transaction_amount": float(partida["preco"]),
-        "description": f"Pelada 40º - Vaga {partida['horario']}",
-        "payment_method_id": "pix",
-        "payer": {
-            "email": "jogador@pelada40.com",
-            "first_name": reserva.nome_jogador
-        }
-    }
-    
-    pix_copia_cola = f"00020126580014br.gov.bcb.pix0136{uuid.uuid4()}520400005303986540518.005802BR5910Pelada406009Recife62070503***6304"
-    qr_code_base64 = ""
+# --- ABA 1: FAZER RESERVA ---
+with tab_reserva:
+    st.header("Partidas Disponíveis Hoje")
     
     try:
-        payment_response = sdk.payment().create(payment_data)
-        payment = payment_response.get("response", {})
-        if "point_of_interaction" in payment:
-            pix_info = payment["point_of_interaction"]["transaction_data"]
-            pix_copia_cola = pix_info.get("qr_code", pix_copia_cola)
-            qr_code_base64 = pix_info.get("qr_code_base64", "")
+        response = requests.get(f"{API_URL}/partidas")
+        if response.status_code == 200:
+            partidas = response.json()
+            
+            for p in partidas:
+                with st.container():
+                    col1, col2, col3 = st.columns([2, 2, 1.5])
+                    with col1:
+                        st.write(f"⏰ **{p['horario']}**")
+                        st.write(f"Preço: **R$ {p['preco']:.2f}**")
+                    with col2:
+                        if p['vagas_livres'] > 0:
+                            st.success(f"🟢 {p['vagas_livres']} vagas livres")
+                        else:
+                            st.error("🔴 Esgotado")
+                    with col3:
+                        if st.button("Garantir Vaga", key=f"btn_{p['id']}"):
+                            st.session_state['partida_selecionada'] = p['id']
+                            st.session_state['horario_selecionado'] = p['horario']
+                    st.divider()
+        else:
+            st.error("Erro ao carregar as partidas.")
     except Exception:
-        pass  # Mantém o Pix simulado caso o token não seja válido
-        
-    # Grava a reserva no banco de dados SQLite
-    cursor.execute("""
-        INSERT INTO reservas (partida_id, nome_jogador, pix_codigo)
-        VALUES (?, ?, ?)
-    """, (reserva.partida_id, reserva.nome_jogador, pix_copia_cola))
-    
-    conn.commit()
-    conn.close()
-    
-    return {
-        "mensagem": "Reserva registrada com sucesso!",
-        "pix_copia_cola": pix_copia_cola,
-        "qr_code_base64": qr_code_base64
-    }
+        st.error("Não foi possível conectar ao servidor backend.")
 
-@app.get("/participantes/{partida_id}")
-def listar_participantes(partida_id: int):
-    conn = get_connection()
-    cursor = conn.cursor()
+    if 'partida_selecionada' in st.session_state:
+        st.subheader(f"Confirmar Reserva - Horário {st.session_state['horario_selecionado']}")
+        
+        nome = st.text_input("Seu Nome Completo:")
+        telefone = st.text_input(
+            "Seu WhatsApp com DDD:",
+            placeholder="11999999999"
+        )
+        
+        if st.button("Gerar Pagamento PIX"):
+            if nome.strip() and telefone.strip():
+                payload = {
+                    "partida_id": st.session_state['partida_selecionada'],
+                    "nome_jogador": nome.strip(),
+                    "telefone": telefone.strip()
+                }
+                res = requests.post(f"{API_URL}/reservar", json=payload)
+                
+                if res.status_code == 200:
+                    data = res.json()
+                    st.success("Reserva gerada com sucesso! Copie o código PIX abaixo:")
+                    st.code(data['pix_copia_cola'], language="text")
+                else:
+                    st.error(f"Erro ao reservar: {res.json().get('detail', 'Tente novamente')}")
+            else:
+                st.warning("Por favor, informe seu nome e WhatsApp com DDD.")
+
+# --- ABA 2: LISTA DE PARTICIPANTES ---
+with tab_lista:
+    st.header("Lista de Confirmados")
+    try:
+        response = requests.get(f"{API_URL}/partidas")
+        if response.status_code == 200:
+            partidas = response.json()
+            partida_opcoes = {f"{p['horario']}": p['id'] for p in partidas}
+            
+            escolha = st.selectbox("Selecione o Horário:", list(partida_opcoes.keys()))
+            partida_id = partida_opcoes[escolha]
+            
+            res_lista = requests.get(f"{API_URL}/participantes/{partida_id}")
+            if res_lista.status_code == 200:
+                jogadores = res_lista.json().get("jogadores", [])
+                if jogadores:
+                    for idx, jog in enumerate(jogadores, 1):
+                        st.write(f"**{idx}.** {jog}")
+                else:
+                    st.info("Nenhum participante confirmado ainda para este horário.")
+    except Exception:
+        st.error("Erro ao carregar lista de participantes.")
+
+# --- ABA 3: SALA DE CONTROLE (ADMIN) ---
+with tab_admin:
+    st.header("⚙️ Painel do Administrador")
     
-    cursor.execute("SELECT nome_jogador FROM reservas WHERE partida_id = ?", (partida_id,))
-    jogadores = [row["nome_jogador"] for row in cursor.fetchall()]
+    senha_admin = st.text_input("Senha de Acesso:", type="password")
     
-    conn.close()
-    return {"partida_id": partida_id, "jogadores": jogadores}
+    if senha_admin == "admin123":
+        st.success("Acesso Autorizado!")
+        headers = {"x-admin-key": senha_admin}
+        
+        try:
+            res_p = requests.get(f"{API_URL}/partidas")
+            if res_p.status_code == 200:
+                partidas = res_p.json()
+                
+                st.subheader("1. Editar Partida (Horário / Preço / Vagas)")
+                id_edit = st.selectbox("Escolha a partida para editar:", [p['id'] for p in partidas], format_func=lambda x: f"Partida ID {x}")
+                
+                partida_atual = next(p for p in partidas if p['id'] == id_edit)
+                novo_horario = st.text_input("Horário:", value=partida_atual['horario'])
+                novo_preco = st.number_input("Preço (R$):", value=float(partida_atual['preco']))
+                novas_vagas = st.number_input("Vagas Totais:", value=int(partida_atual['vagas_totais']))
+                
+                if st.button("Salvar Alterações da Partida"):
+                    update_payload = {
+                        "horario": novo_horario,
+                        "preco": novo_preco,
+                        "vagas_totais": novas_vagas
+                    }
+                    res_up = requests.put(f"{API_URL}/admin/partida/{id_edit}", json=update_payload, headers=headers)
+                    if res_up.status_code == 200:
+                        st.success("Partida atualizada com sucesso!")
+                        st.rerun()
+                    else:
+                        st.error("Erro ao atualizar partida.")
+
+                st.divider()
+                st.subheader("2. Remover Jogador da Lista")
+                partida_rem = st.selectbox("Selecione a Partida:", [p['id'] for p in partidas], key="select_rem", format_func=lambda x: f"Partida ID {x}")
+                
+                res_j = requests.get(f"{API_URL}/participantes/{partida_rem}")
+                if res_j.status_code == 200:
+                    lista_j = res_j.json().get("jogadores", [])
+                    if lista_j:
+                        jogador_remover = st.selectbox("Selecione o Jogador:", lista_j)
+                        if st.button("Remover Jogador"):
+                            rem_payload = {"partida_id": partida_rem, "nome_jogador": jogador_remover}
+                            res_del = requests.post(f"{API_URL}/admin/remover-jogador", json=rem_payload, headers=headers)
+                            if res_del.status_code == 200:
+                                st.warning(f"Jogador {jogador_remover} removido!")
+                                st.rerun()
+                    else:
+                        st.info("Sem jogadores nesta partida.")
+        except Exception:
+            st.error("Erro ao carregar dados do admin.")
+    elif senha_admin != "":
+        st.error("Senha incorreta!")

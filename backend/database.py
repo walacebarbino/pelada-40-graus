@@ -27,6 +27,13 @@ def init_db():
             FOREIGN KEY (partida_id) REFERENCES partidas (id)
         )
     """)
+
+        # Adiciona telefone em bancos existentes, sem apagar reservas.
+    cursor.execute("PRAGMA table_info(reservas)")
+    colunas = {coluna[1] for coluna in cursor.fetchall()}
+
+    if "telefone" not in colunas:
+        cursor.execute("ALTER TABLE reservas ADD COLUMN telefone TEXT")
     
     # Popula as partidas iniciais se a tabela estiver vazia
     cursor.execute("SELECT COUNT(*) FROM partidas")

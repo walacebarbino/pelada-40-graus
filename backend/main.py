@@ -9,12 +9,12 @@ app = FastAPI(title="Pelada 40º API")
 init_db()
 sdk = mercadopago.SDK("SUA_ACCESS_TOKEN_TESTE")
 
-# Senha simples de admin para o painel de controle
 ADMIN_SECRET_KEY = "admin123"
 
 class ReservaRequest(BaseModel):
     partida_id: int
     nome_jogador: str
+    telefone: str
 
 class PartidaUpdate(BaseModel):
     horario: str
@@ -58,6 +58,19 @@ def listar_partidas():
 
 @app.post("/reservar")
 def fazer_reserva(reserva: ReservaRequest):
+    telefone = "".join(
+        caractere for caractere in reserva.telefone
+        if caractere in "0123456789"
+    )
+
+    if len(telefone) not in (10, 11):
+        raise HTTPException(
+            status_code=400,
+            detail="Informe o telefone com DDD, usando 10 ou 11 dígitos, sem o +55."
+        )
+
+    reserva.telefone = telefone
+
     conn = get_connection()
     cursor = conn.cursor()
     
@@ -73,28 +86,56 @@ def fazer_reserva(reserva: ReservaRequest):
         conn.close()
         raise HTTPException(status_code=400, detail="Sem vagas disponíveis para este horário")
     
-    pix_copia_cola = f"00020126580014br.gov.bcb.pix0136{uuid.uuid4()}520400005303986540518.005802BR5910Pelada406009Recife62070503***6304"
-    qr_code_base64 = ""
-    
     try:
         payment_response = sdk.payment().create({
             "transaction_amount": float(partida["preco"]),
             "description": f"Pelada 40º - Vaga {partida['horario']}",
             "payment_method_id": "pix",
-            "payer": {"email": "jogador@pelada40.com", "first_name": reserva.nome_jogador}
+            "payer": {
+                "email": "jogador@pelada40.com",
+                "first_name": reserva.nome_jogador
+            }
         })
-        payment = payment_response.get("response", {})
-        if "point_of_interaction" in payment:
-            pix_info = payment["point_of_interaction"]["transaction_data"]
-            pix_copia_cola = pix_info.get("qr_code", pix_copia_cola)
-            qr_code_base64 = pix_info.get("qr_code_base64", "")
     except Exception:
-        pass
+        conn.close()
+        raise HTTPException(
+            status_code=502,
+            detail="Não foi possível conectar ao Mercado Pago. A reserva não foi registrada."
+        )
+
+    if payment_response.get("status") not in (200, 201):
+        conn.close()
+        raise HTTPException(
+            status_code=502,
+            detail="O Mercado Pago não criou a cobrança. A reserva não foi registrada."
+        )
+
+    payment = payment_response.get("response") or {}
+    interacao = payment.get("point_of_interaction") or {}
+    pix_info = interacao.get("transaction_data") or {}
+
+    pix_copia_cola = pix_info.get("qr_code")
+    qr_code_base64 = pix_info.get("qr_code_base64") or ""
+
+    if not pix_copia_cola:
+        conn.close()
+        raise HTTPException(
+            status_code=502,
+            detail="O Mercado Pago não retornou o código Pix. A reserva não foi registrada; não tente pagar nem repetir a cobrança antes de verificar."
+        )
         
     cursor.execute("""
-        INSERT INTO reservas (partida_id, nome_jogador, pix_codigo)
-        VALUES (?, ?, ?)
-    """, (reserva.partida_id, reserva.nome_jogador, pix_copia_cola))
+        INSERT INTO reservas (
+            partida_id, nome_jogador, telefone, pix_codigo, status
+        )
+        VALUES (?, ?, ?, ?, ?)
+    """, (
+        reserva.partida_id,
+        reserva.nome_jogador,
+        reserva.telefone,
+        pix_copia_cola,
+        "pendente"
+    ))
     
     conn.commit()
     conn.close()
@@ -109,12 +150,23 @@ def fazer_reserva(reserva: ReservaRequest):
 def listar_participantes(partida_id: int):
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT nome_jogador FROM reservas WHERE partida_id = ?", (partida_id,))
-    jogadores = [row["nome_jogador"] for row in cursor.fetchall()]
-    conn.close()
-    return {"partida_id": partida_id, "jogadores": jogadores}
 
-# --- ROTAS EXCLUSIVAS DO ADMINISTRADOR ---
+    cursor.execute("""
+        SELECT nome_jogador
+        FROM reservas
+        WHERE partida_id = ?
+          AND status = ?
+        ORDER BY id
+    """, (partida_id, "confirmado"))
+
+    jogadores = [row["nome_jogador"] for row in cursor.fetchall()]
+
+    conn.close()
+
+    return {
+        "partida_id": partida_id,
+        "jogadores": jogadores
+    }
 
 @app.put("/admin/partida/{partida_id}")
 def atualizar_partida(partida_id: int, dados: PartidaUpdate, x_admin_key: str = Header(None)):
