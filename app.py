@@ -8,7 +8,7 @@ st.subheader("Garanta sua vaga na partida de 40 minutos!")
 
 st.markdown("---")
 
-API_URL = "http://127.0.0.1:8000"
+API_URL = "https://pelada-40-graus.onrender.com"
 
 try:
     response = requests.get(f"{API_URL}/partidas")
