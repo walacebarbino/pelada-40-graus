@@ -1,114 +1,116 @@
-import streamlit as st
-import requests
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+import uuid
+import mercadopago
+from backend.database import init_db, get_connection
 
-st.set_page_config(page_title="Pelada 40º", page_icon="⚽", layout="centered")
+app = FastAPI(title="Pelada 40º API")
 
-st.title("⚽ Pelada 40º")
-st.subheader("Garanta sua vaga na partida de 40 minutos!")
+# Inicializa as tabelas do banco ao subir a aplicação
+init_db()
 
-st.markdown("---")
+# SDK Mercado Pago (coloque sua Access Token de teste aqui se desejar)
+sdk = mercadopago.SDK("SUA_ACCESS_TOKEN_TESTE")
 
-API_URL = "https://pelada-40-graus.onrender.com"
+class ReservaRequest(BaseModel):
+    partida_id: int
+    nome_jogador: str
 
-try:
-    response = requests.get(f"{API_URL}/partidas")
-    partidas = response.json() if response.status_code == 200 else []
-except:
-    st.warning("⚠️ Servidor backend inacessível.")
-    partidas = []
+@app.get("/")
+def home():
+    return {"status": "API Pelada 40º rodando com SQLite!"}
 
-# --- CRIANDO AS ABAS ---
-tab_reservas, tab_lista = st.tabs(["📅 Fazer Reserva", "📋 Lista de Participantes"])
-
-# --- CONTEÚDO DA ABA 1: RESERVAS ---
-with tab_reservas:
-    st.markdown("### 📅 Partidas Disponíveis Hoje")
-
-    for p in partidas:
-        vagas_disponiveis = p["vagas_totais"] - p["vagas_ocupadas"]
-        
-        col1, col2, col3 = st.columns([2, 2, 1])
-        
-        with col1:
-            st.markdown(f"**⏰ {p['horario']}**")
-            st.text(f"Preço: R$ {p['preco']:.2f}")
-            
-        with col2:
-            if vagas_disponiveis > 0:
-                st.success(f"🟢 {vagas_disponiveis} vagas livres")
-            else:
-                st.error("🔴 Partida Lotada")
-                
-        with col3:
-            if vagas_disponiveis > 0:
-                if st.button("Garantir Vaga", key=f"btn_{p['id']}"):
-                    st.session_state[f"reservando_{p['id']}"] = True
-            else:
-                st.button("Lotado", disabled=True, key=f"btn_{p['id']}")
-                
-        if st.session_state.get(f"reservando_{p['id']}", False):
-            if f"pix_gerado_{p['id']}" in st.session_state:
-                st.success("Vaga garantida! Pague via Pix abaixo:")
-                st.text_input("Código Pix (Copia e Cola):", value=st.session_state[f"pix_gerado_{p['id']}"], key=f"pix_{p['id']}")
-                
-                if st.button("🟢 Simular Pagamento Aprovado", key=f"simular_{p['id']}"):
-                    sim_payload = {
-                        "partida_id": p["id"],
-                        "nome": st.session_state[f"nome_{p['id']}"],
-                        "telefone": st.session_state[f"tel_{p['id']}"]
-                    }
-                    sim_res = requests.post(f"{API_URL}/simular-pagamento", json=sim_payload)
-                    if sim_res.status_code == 200:
-                        st.success("Pagamento confirmado! Nome adicionado à lista.")
-                        st.session_state[f"reservando_{p['id']}"] = False
-                        del st.session_state[f"pix_gerado_{p['id']}"]
-                        st.rerun()
-                    else:
-                        st.error("Erro ao simular pagamento.")
-                
-                st.info("Assim que pagar, o seu nome entra na lista da partida!")
-            else:
-                with st.form(key=f"form_reserva_{p['id']}"):
-                    st.markdown(f"**Preencher dados para o horário: {p['horario']}**")
-                    nome_jogador = st.text_input("Seu Nome Completo", key=f"input_nome_{p['id']}")
-                    tel_jogador = st.text_input("Seu WhatsApp / Telefone", key=f"input_tel_{p['id']}")
-                    
-                    submitted = st.form_submit_button("Confirmar e Gerar Pix")
-                    
-                    if submitted:
-                        if nome_jogador and tel_jogador:
-                            payload = {
-                                "partida_id": p["id"],
-                                "nome": nome_jogador,
-                                "telefone": tel_jogador
-                            }
-                            res = requests.post(f"{API_URL}/reservar", json=payload)
-                            if res.status_code == 200:
-                                dados_reserva = res.json()
-                                st.session_state[f"pix_gerado_{p['id']}"] = dados_reserva["pix_copia_cola"]
-                                st.session_state[f"nome_{p['id']}"] = nome_jogador
-                                st.session_state[f"tel_{p['id']}"] = tel_jogador
-                                st.rerun()
-                            else:
-                                st.error(res.json().get("detail", "Erro ao reservar."))
-                        else:
-                            st.warning("Por favor, preencha o nome e o telemóvel.")
-                        
-        st.markdown("---")
-
-# --- CONTEÚDO DA ABA 2: LISTA DE PARTICIPANTES ---
-with tab_lista:
-    st.markdown("### 📋 Jogadores Confirmados por Horário")
+@app.get("/partidas")
+def listar_partidas():
+    conn = get_connection()
+    cursor = conn.cursor()
     
-    if not partidas:
-        st.info("Nenhuma partida encontrada.")
-    else:
-        for p in partidas:
-            with st.expander(f"⚽ Horário: {p['horario']} ({p['vagas_ocupadas']}/{p['vagas_totais']} vagas)"):
-                participantes = p.get("participantes", [])
-                if participantes:
-                    st.markdown("**Atletas confirmados:**")
-                    for idx, nome_atleta in enumerate(participantes, 1):
-                        st.write(f"{idx}. ⚽ {nome_atleta}")
-                else:
-                    st.caption("Nenhum atleta confirmado ainda para este horário.")
+    cursor.execute("SELECT * FROM partidas")
+    partidas = cursor.fetchall()
+    
+    resultado = []
+    for p in partidas:
+        # Conta quantas reservas já foram feitas para essa partida
+        cursor.execute("SELECT COUNT(*) FROM reservas WHERE partida_id = ?", (p["id"],))
+        reservas_feitas = cursor.fetchone()[0]
+        vagas_livres = p["vagas_totais"] - reservas_feitas
+        
+        resultado.append({
+            "id": p["id"],
+            "horario": p["horario"],
+            "vagas_totais": p["vagas_totais"],
+            "vagas_livres": max(0, vagas_livres),
+            "preco": p["preco"]
+        })
+        
+    conn.close()
+    return resultado
+
+@app.post("/reservar")
+def fazer_reserva(reserva: ReservaRequest):
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    # Verifica a partida
+    cursor.execute("SELECT * FROM partidas WHERE id = ?", (reserva.partida_id,))
+    partida = cursor.fetchone()
+    if not partida:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Partida não encontrada")
+        
+    # Verifica vagas disponíveis
+    cursor.execute("SELECT COUNT(*) FROM reservas WHERE partida_id = ?", (reserva.partida_id,))
+    reservas_feitas = cursor.fetchone()[0]
+    if reservas_feitas >= partida["vagas_totais"]:
+        conn.close()
+        raise HTTPException(status_code=400, detail="Sem vagas disponíveis para este horário")
+    
+    # Gera cobrança PIX via Mercado Pago
+    payment_data = {
+        "transaction_amount": float(partida["preco"]),
+        "description": f"Pelada 40º - Vaga {partida['horario']}",
+        "payment_method_id": "pix",
+        "payer": {
+            "email": "jogador@pelada40.com",
+            "first_name": reserva.nome_jogador
+        }
+    }
+    
+    pix_copia_cola = f"00020126580014br.gov.bcb.pix0136{uuid.uuid4()}520400005303986540518.005802BR5910Pelada406009Recife62070503***6304"
+    qr_code_base64 = ""
+    
+    try:
+        payment_response = sdk.payment().create(payment_data)
+        payment = payment_response.get("response", {})
+        if "point_of_interaction" in payment:
+            pix_info = payment["point_of_interaction"]["transaction_data"]
+            pix_copia_cola = pix_info.get("qr_code", pix_copia_cola)
+            qr_code_base64 = pix_info.get("qr_code_base64", "")
+    except Exception:
+        pass  # Mantém o Pix simulado caso o token não seja válido
+        
+    # Grava a reserva no banco de dados SQLite
+    cursor.execute("""
+        INSERT INTO reservas (partida_id, nome_jogador, pix_codigo)
+        VALUES (?, ?, ?)
+    """, (reserva.partida_id, reserva.nome_jogador, pix_copia_cola))
+    
+    conn.commit()
+    conn.close()
+    
+    return {
+        "mensagem": "Reserva registrada com sucesso!",
+        "pix_copia_cola": pix_copia_cola,
+        "qr_code_base64": qr_code_base64
+    }
+
+@app.get("/participantes/{partida_id}")
+def listar_participantes(partida_id: int):
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT nome_jogador FROM reservas WHERE partida_id = ?", (partida_id,))
+    jogadores = [row["nome_jogador"] for row in cursor.fetchall()]
+    
+    conn.close()
+    return {"partida_id": partida_id, "jogadores": jogadores}
