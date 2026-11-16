@@ -1,4 +1,5 @@
 import math
+import os
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,11 @@ from queries import (
     MatchNotFoundError,
     list_confirmed_participant_names,
     list_matches,
+)
+from reservations_api import (
+    ReservationHTTPSettings,
+    configure_reservation_http,
+    reservation_http_enabled,
 )
 
 
@@ -263,3 +269,13 @@ def excluir_partida_v2(
         ) from None
 
     return Response(status_code=204)
+
+
+if reservation_http_enabled(
+    os.environ.get("PELADA_RESERVATION_HTTP_ENABLED")
+):
+    configure_reservation_http(
+        app,
+        enabled=True,
+        settings=ReservationHTTPSettings.from_environment(),
+    )

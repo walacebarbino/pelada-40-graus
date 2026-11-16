@@ -85,7 +85,63 @@ O banco garante unicidade dos hashes e uma associação um-a-um entre metadados 
 
 `recover_temporary_reservation` autoriza a consulta exclusivamente pelo segredo de recuperação. Retorna somente ID e ID da partida, estado efetivo, prazo original e preço; não retorna nome, telefone nem credenciais. O ID sequencial não autoriza acesso. A comparação das credenciais usa `hmac.compare_digest`.
 
-Este é um serviço interno: **não existem rotas de criação ou recuperação**, a interface pública não foi habilitada e esta entrega não autoriza exposição pública. Ainda não há proteção HTTP contra abuso, limitação de requisições, idempotência de transporte ou fluxo de recuperação no navegador. Idempotência evita duplicar uma mesma operação, mas não impede alguém de criar muitas operações com chaves distintas.
+Este é um serviço interno: as rotas HTTP abaixo estão desabilitadas por padrão, a interface não foi conectada e esta entrega não autoriza exposição pública. Há somente limitação provisória em memória, insuficiente contra abuso distribuído; a interface ainda não guarda credenciais nem implementa retries ou recuperação no navegador. Idempotência evita duplicar uma mesma operação, mas não impede alguém de criar muitas operações com chaves distintas.
+
+## Contrato HTTP de reserva (desabilitado por padrão)
+
+`main.py` registra as rotas somente quando `PELADA_RESERVATION_HTTP_ENABLED=1` está presente no ambiente do processo. O valor não é definido por este projeto em `.env` nem na configuração real da máquina. Sem a configuração explícita, as rotas não fazem parte da aplicação. Habilitá-las localmente não autoriza exposição pública; a implantação permanece bloqueada até revisão dos controles de borda e da configuração operacional.
+
+As rotas chamam o serviço interno existente em uma thread de trabalho, injetando caminho do banco e relógio. Não abrem banco em import ou startup e não executam migrações.
+
+### Criar ou repetir
+
+`POST /api/v2/reservas` exige `Content-Type: application/json`, `Idempotency-Key: <chave>` e `Authorization: Bearer <segredo-de-recuperacao>`. O corpo aceita exatamente:
+
+```json
+{"match_id": 123, "player_name": "Nome", "player_phone": "11999999999"}
+```
+
+Uma criação e um replay válido retornam HTTP 200 com somente `status`, `locked_until` e `price_per_slot_cents`. Não retornam IDs, nome, telefone ou credenciais. O prazo é sempre o original; um retry não o renova. Se a chave válida já estiver associada a uma operação, o serviço a procura antes de aplicar as condições exclusivas de uma nova reserva. Dados ou segredo diferentes resultam em conflito genérico, inclusive quando o payload não é semanticamente válido.
+
+O cliente deve gerar e guardar as duas credenciais independentes e o corpo normalizado antes do primeiro envio. Em timeout ou resposta incerta, deve repetir o mesmo corpo com as mesmas credenciais, sem gerar outra operação automaticamente. A rota não aceita credenciais em URL. A interface ainda não implementa esse protocolo.
+
+A quota é verificada primeiro; em seguida, a chave de idempotência precisa ter formato válido. Para uma chave válida, erros de tipo de conteúdo, JSON, estrutura, campos ou segredo são encaminhados ao serviço, que procura a operação antes da validação de uma nova reserva. Assim, uma chave já usada recebe 409 genérico mesmo com esses outros dados inválidos. Para uma chave ainda não usada, tipo de conteúdo incorreto recebe 415 e dados inválidos recebem 422.
+
+### Recuperar
+
+`GET /api/v2/reservas/recuperacao` recebe exclusivamente `Authorization: Bearer <segredo-de-recuperacao>`. Responde HTTP 200 com os mesmos três campos mínimos do POST. Segredo ausente, inválido, incorreto ou não associado produz a mesma resposta genérica HTTP 404. A chave de idempotência e o ID sequencial não autorizam recuperação.
+
+### Validação e erros públicos
+
+O corpo tem limite de 4096 bytes, mesmo sem `Content-Length` ou se esse cabeçalho estiver incorreto. O limite de cabeçalhos é **agregado**: a soma dos nomes e valores não pode ultrapassar 8192 bytes. Além desse teto, `Idempotency-Key` aceita no máximo 43 caracteres e `Authorization` no máximo 50. O serviço valida `match_id`, nome (até 120 caracteres) e telefone (até 24 caracteres). Campos extras e chaves JSON duplicadas são rejeitados.
+
+Respostas das rotas, inclusive erros, usam `Cache-Control: no-store`; entradas recusadas no limite de cabeçalhos retornam 431. Os códigos públicos são estáveis e não incluem mensagens SQLite, valores recebidos ou detalhes internos:
+
+| HTTP | `error.code` | Situação |
+| --- | --- | --- |
+| 200 | — | Reserva criada, repetida ou recuperada |
+| 404 | `match_not_found` / `reservation_not_found` | Partida inexistente / recuperação não autorizada |
+| 409 | `idempotency_conflict` / `no_vacancy` / `match_unavailable` | Conflito, lotação ou partida indisponível |
+| 415 | `invalid_request` | Tipo de conteúdo diferente de JSON |
+| 422 | `invalid_request` | Campos, credenciais ou JSON inválidos |
+| 429 | `rate_limited` | Quota temporária excedida; inclui `Retry-After` |
+| 431 | `headers_too_large` | Cabeçalhos excedem o limite |
+| 503 | `service_unavailable` | Banco ocupado, indisponível ou esquema incompatível |
+| 500 | `internal_error` | Falha inesperada, sem detalhes internos |
+
+O banco ocupado retorna `Retry-After: 1`; esquema v2 ou incompatível retorna 503 sem sugerir retry, pois uma repetição não migra o banco. Nenhum corpo, cabeçalho de autorização, chave, nome ou telefone é escrito em logs; falhas inesperadas registram somente o tipo da exceção.
+
+### Origem, CORS e abuso
+
+Por padrão não há origens de navegador autorizadas. Uma implantação que precise de navegador deve configurar `PELADA_RESERVATION_ALLOWED_ORIGINS` com origens exatas separadas por vírgula; curingas e a origem `null` não são aceitos. Um pedido sem `Origin` é aceito para clientes não navegador; a aplicação não consegue provar o tipo do cliente pela ausência desse cabeçalho, que também não autentica a requisição. Origin não autorizado ou `null` é recusado. O preflight só permite métodos e cabeçalhos definidos para estas rotas; não são habilitadas credenciais CORS amplas.
+
+O limitador token-bucket é **por processo e por endereço de cliente observado pelo ASGI**, com contadores separados para criação e recuperação. Os padrões provisórios são 5 criações/minuto e 10 recuperações/minuto. Não há quota global nem quota por partida. Os limites podem ser configurados por `PELADA_RESERVATION_CREATE_LIMIT`, `PELADA_RESERVATION_RECOVERY_LIMIT`, `PELADA_RESERVATION_RATE_WINDOW_SECONDS` e `PELADA_RESERVATION_LIMITER_MAX_ENTRIES`; o último define a capacidade máxima de entradas.
+
+Cada tentativa que chega ao handler de criação consome quota, incluindo replay e tentativa inválida. A quota também é consumida por tentativas de recuperação, inclusive quando a credencial não autoriza. Requisições rejeitadas pelo middleware antes do handler — por exemplo, Origin recusado, limite de cabeçalhos ou corpo excedido — não consomem quota. Um retry legítimo também pode receber 429; após `Retry-After`, repetir com os mesmos cabeçalhos e payload é seguro: a operação original não é recriada nem tem o prazo renovado.
+
+Entradas inativas expiram após a janela correspondente, com limpeza preguiçosa no próximo consumo. O mapa é protegido por lock de thread e limitado a 10.000 entradas por padrão. Quando atinge a capacidade, o limitador expulsa a entrada menos recentemente usada e aceita a nova chave; isso pode permitir evasão das quotas anteriores.
+
+Esse limitador não é distribuído: workers têm contadores independentes e reinícios os apagam. Usuários atrás de NAT podem compartilhar a quota; atrás de proxy, o endereço observado pode representar todos os clientes. O código não confia em `X-Forwarded-For`. Idempotência, o limitador processual e controles do cliente não bastam para prevenir abuso com chaves diferentes. **Não é proteção para exposição pública**: ela continua bloqueada até revisão dos limites de borda, configuração de proxies confiáveis e implantação.
 
 ## Cadastro administrativo local
 
@@ -107,15 +163,15 @@ Essa chave não deve ser colocada em `.env`, no código, no histórico de comand
 
 ## Ambiente Python para migração e testes
 
-A suíte completa foi executada com CPython 3.15.2 no Windows: 80 testes passaram, sem testes ignorados. Todos usam SQLite temporário; nenhum banco real foi aberto ou migrado. Nenhuma outra versão do Python foi testada ou declarada compatível.
+A suíte completa foi executada com CPython 3.15.2 no Windows: 107 testes passaram, sem testes ignorados. Os testes HTTP usam `httpx.AsyncClient` com `ASGITransport`, sem servidor real; como o transporte não executa lifespan automaticamente, as fixtures criam o esquema temporário antes das requisições. Todos os testes usam SQLite temporário; nenhum banco real é aberto ou migrado.
 
-As dependências externas diretas, com as versões usadas, estão em `requirements.txt`. `tzdata` fornece a base IANA necessária para `America/Sao_Paulo` no Windows. `uvicorn`, Streamlit e Mercado Pago não fazem parte deste ambiente de testes; a suíte não inicia servidor nem usa integração de pagamento.
+As dependências de runtime estão em `requirements.txt`; `requirements-test.txt` inclui esse arquivo e fixa `httpx==0.28.1` para os testes ASGI. `tzdata` fornece a base IANA necessária para `America/Sao_Paulo` no Windows. `uvicorn`, Streamlit e Mercado Pago não fazem parte deste ambiente de testes; a suíte não inicia servidor nem usa integração de pagamento.
 
 A partir de `Pelada sob Demanda/migracao/`, prepare o ambiente isolado e execute os testes:
 
 ```powershell
 py -3.15 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m pip install -r requirements-test.txt
 .\.venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py" -v
 ```
 
@@ -132,16 +188,15 @@ No PowerShell, a partir de `Pelada sob Demanda/migracao/`:
 
 ## Ainda não implementado
 
-As rotas proxy antigas continuam disponíveis apenas para comparação; a interface usa exclusivamente a API v2, sem fallback. Cadastro e edição de partidas são as únicas escritas administrativas expostas. O serviço de reserva idempotente e recuperação existe somente como API interna de Python; não há rotas para criação, consulta ou recuperação, nem integração com a interface. Ainda não existem exclusão de partidas, votos, suporte a cancelamento de reservas, autenticação definitiva, cobrança ou confirmação de pagamento.
+As rotas proxy antigas continuam disponíveis apenas para comparação; a interface usa exclusivamente a API v2, sem fallback. Cadastro e edição de partidas são as únicas escritas administrativas expostas. As rotas HTTP de reserva estão implementadas, mas desabilitadas por padrão; a interface não as chama e o fluxo de guardar credenciais antes do POST ainda não está implementado. Ainda não existem exclusão de partidas, votos, suporte a cancelamento de reservas, autenticação definitiva, cobrança ou confirmação de pagamento.
 
 ### Pendências antes de qualquer exposição pública
 
-Antes de qualquer exposição pública, implementar e revisar:
+Antes de qualquer exposição pública, revisar e implementar:
 
-- rotas HTTP e testes de contrato, sem expor credenciais ou PII em URLs e logs;
+- controles de borda distribuídos, limites por implantação e confiança explícita em proxies;
 - geração e armazenamento seguro, no navegador, das credenciais antes do POST para resistir a resposta perdida;
 - autorização e recuperação no cliente, com resposta mínima;
-- proteção contra abuso e limitação de requisições. Idempotência não limita operações com chaves diferentes;
 - revisão de segurança das rotas e da política de expiração antes de conectar a interface.
 
 Esta entrega não migrou nem abriu o banco real e não autoriza exposição pública do bloqueio.
