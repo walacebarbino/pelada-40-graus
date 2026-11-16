@@ -1,0 +1,4 @@
+fastapi==0.163.1
+pydantic==2.14.3
+requests==2.34.2
+tzdata==2026.6

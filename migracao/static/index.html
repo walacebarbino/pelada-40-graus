@@ -1,0 +1,416 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#0a0f0d" />
+    <title>Peladas disponíveis</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+    <script src="/static/app.js" defer></script>
+  </head>
+  <body>
+    <div class="top-accent" aria-hidden="true"></div>
+    <main class="page">
+      <div id="matches-panel">
+        <header class="page-header">
+          <p class="eyebrow">Pelada por Demanda</p>
+          <h1>Partidas <span>disponíveis</span></h1>
+          <p class="intro">
+            Horários, vagas e preços informados pela API.
+          </p>
+        </header>
+
+        <section aria-labelledby="matches-heading">
+          <div class="section-heading">
+            <div class="section-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none">
+                <rect x="3.5" y="5" width="17" height="16" rx="2.5"></rect>
+                <path d="M7.5 3v4M16.5 3v4M3.5 10h17"></path>
+                <path d="M8 14h.01M12 14h.01M16 14h.01M8 17.5h.01M12 17.5h.01"></path>
+              </svg>
+            </div>
+            <div>
+              <h2 id="matches-heading" tabindex="-1">Lista de partidas</h2>
+              <p>Consulte os horários e a disponibilidade.</p>
+            </div>
+          </div>
+
+          <p id="matches-feedback" class="form-feedback" role="status" aria-live="polite"></p>
+          <div id="matches" class="matches" aria-live="polite" aria-busy="true">
+            <p class="state-message">Carregando partidas...</p>
+          </div>
+        </section>
+
+        <p class="availability-note">
+          O formulário de reserva é apenas local. Envio de reservas, pagamentos e
+          ranking ainda não estão disponíveis.
+        </p>
+      </div>
+
+      <section id="admin-panel" hidden aria-labelledby="admin-heading">
+        <header class="page-header">
+          <p class="eyebrow">Área administrativa</p>
+          <h1 id="admin-heading" tabindex="-1">Administração</h1>
+          <p class="intro">
+            Crie ou edite partidas. A chave é validada pelo servidor e fica somente
+            nesta tela enquanto o painel estiver aberto.
+          </p>
+        </header>
+
+        <p class="privacy-note admin-security-note">
+          Proteção provisória para desenvolvimento local; não é autenticação
+          definitiva para produção.
+        </p>
+
+        <section class="admin-match-section" aria-labelledby="admin-matches-heading">
+          <div class="section-heading">
+            <div class="section-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none">
+                <rect x="3.5" y="5" width="17" height="16" rx="2.5"></rect>
+                <path d="M7.5 3v4M16.5 3v4M3.5 10h17"></path>
+              </svg>
+            </div>
+            <div>
+              <h2 id="admin-matches-heading" tabindex="-1">Partidas cadastradas</h2>
+              <p>Data e local ajudam a identificar cada partida.</p>
+            </div>
+          </div>
+          <div id="admin-matches" class="matches" aria-live="polite" aria-busy="true">
+            <p class="state-message">Carregando partidas...</p>
+          </div>
+        </section>
+
+        <form id="admin-form" class="booking-form admin-form" novalidate>
+          <h2 id="admin-form-heading" tabindex="-1">Cadastrar partida</h2>
+          <fieldset id="admin-fieldset" class="admin-fieldset">
+            <div class="field">
+              <label for="admin-key">Chave administrativa</label>
+              <input
+                id="admin-key"
+                type="password"
+                autocomplete="off"
+                spellcheck="false"
+                aria-describedby="admin-key-error"
+                aria-invalid="false"
+                required
+              />
+              <p id="admin-key-error" class="field-error" aria-live="polite"></p>
+            </div>
+
+            <div class="field">
+              <label for="match-title">Título</label>
+              <input
+                id="match-title"
+                type="text"
+                aria-describedby="match-title-error"
+                aria-invalid="false"
+                required
+              />
+              <p id="match-title-error" class="field-error" aria-live="polite"></p>
+            </div>
+
+            <div class="field-row">
+              <div class="field">
+                <label for="match-date">Data</label>
+                <input
+                  id="match-date"
+                  type="date"
+                  aria-describedby="match-date-error"
+                  aria-invalid="false"
+                  required
+                />
+                <p id="match-date-error" class="field-error" aria-live="polite"></p>
+              </div>
+              <div class="field">
+                <label for="match-time">Horário</label>
+                <input
+                  id="match-time"
+                  type="time"
+                  step="60"
+                  aria-describedby="match-time-error"
+                  aria-invalid="false"
+                  required
+                />
+                <p id="match-time-error" class="field-error" aria-live="polite"></p>
+              </div>
+            </div>
+
+            <div class="field">
+              <label for="match-location">Local</label>
+              <input
+                id="match-location"
+                type="text"
+                aria-describedby="match-location-error"
+                aria-invalid="false"
+                required
+              />
+              <p id="match-location-error" class="field-error" aria-live="polite"></p>
+            </div>
+
+            <div class="field-row">
+              <div class="field">
+                <label for="match-duration">Duração (minutos)</label>
+                <input
+                  id="match-duration"
+                  type="number"
+                  min="1"
+                  step="1"
+                  inputmode="numeric"
+                  aria-describedby="match-duration-error"
+                  aria-invalid="false"
+                  required
+                />
+                <p id="match-duration-error" class="field-error" aria-live="polite"></p>
+              </div>
+              <div class="field">
+                <label for="match-players">Limite de jogadores</label>
+                <select
+                  id="match-players"
+                  aria-describedby="match-players-error"
+                  aria-invalid="false"
+                  required
+                >
+                  <option value="10">10 jogadores</option>
+                  <option value="12">12 jogadores</option>
+                  <option value="14">14 jogadores</option>
+                </select>
+                <p id="match-players-error" class="field-error" aria-live="polite"></p>
+              </div>
+            </div>
+
+            <div class="field">
+              <label for="match-price">Preço por vaga (R$)</label>
+              <input
+                id="match-price"
+                type="text"
+                inputmode="decimal"
+                placeholder="Ex.: 18,50"
+                aria-describedby="match-price-hint match-price-error"
+                aria-invalid="false"
+                required
+              />
+              <p id="match-price-hint" class="field-hint">
+                Use até duas casas decimais, sem separador de milhar.
+              </p>
+              <p id="match-price-error" class="field-error" aria-live="polite"></p>
+            </div>
+          </fieldset>
+
+          <p id="admin-feedback" class="form-feedback" role="status" aria-live="polite"></p>
+          <div class="admin-form-actions">
+            <button id="create-match" class="validate-button" type="submit">
+              Cadastrar partida
+            </button>
+            <button id="cancel-edit" class="retry-button cancel-edit-button" type="button" hidden>
+              Cancelar edição
+            </button>
+          </div>
+        </form>
+      </section>
+    </main>
+
+    <dialog
+      id="delete-match-dialog"
+      class="booking-dialog delete-match-dialog"
+      aria-labelledby="delete-match-title"
+      aria-describedby="delete-match-warning"
+    >
+      <section class="booking-modal">
+        <header class="modal-header">
+          <div>
+            <p class="eyebrow">Ação administrativa</p>
+            <h2 id="delete-match-title" tabindex="-1">Excluir partida</h2>
+          </div>
+        </header>
+
+        <p id="delete-match-warning" class="delete-match-warning">
+          Esta exclusão é definitiva e não pode ser desfeita.
+        </p>
+        <dl class="delete-match-summary">
+          <div><dt>Título</dt><dd id="delete-match-summary-title"></dd></div>
+          <div><dt>Data</dt><dd id="delete-match-summary-date"></dd></div>
+          <div><dt>Horário</dt><dd id="delete-match-summary-time"></dd></div>
+          <div><dt>ID</dt><dd id="delete-match-summary-id"></dd></div>
+        </dl>
+
+        <p id="delete-match-feedback" class="form-feedback" role="status" aria-live="polite"></p>
+        <button id="refresh-after-delete" class="retry-button" type="button" hidden>
+          Atualizar listagem
+        </button>
+        <div class="delete-match-actions">
+          <button id="cancel-delete-match" class="retry-button" type="button">Voltar</button>
+          <button id="confirm-delete-match" class="delete-confirm-button" type="button">
+            Excluir partida
+          </button>
+        </div>
+      </section>
+    </dialog>
+
+    <dialog
+      id="booking-dialog"
+      class="booking-dialog"
+      aria-labelledby="booking-title"
+      aria-describedby="availability-note"
+    >
+      <section class="booking-modal">
+        <header class="modal-header">
+          <div>
+            <p class="eyebrow">Próximo passo</p>
+            <h2 id="booking-title" tabindex="-1">Escolher horário</h2>
+          </div>
+          <button
+            id="close-dialog"
+            class="icon-button"
+            type="button"
+            aria-label="Fechar formulário"
+          >
+            <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+              <path d="m6 6 12 12M18 6 6 18"></path>
+            </svg>
+          </button>
+        </header>
+
+        <div class="booking-summary">
+          <div class="summary-row">
+            <span>Horário</span>
+            <strong id="selected-schedule"></strong>
+          </div>
+          <div class="summary-row">
+            <span>Preço por vaga</span>
+            <strong id="selected-price" class="summary-price"></strong>
+          </div>
+          <div class="summary-row">
+            <span>Disponibilidade da última consulta</span>
+            <strong id="selected-availability"></strong>
+          </div>
+        </div>
+
+        <p id="availability-note" class="availability-reminder">
+          A disponibilidade será verificada novamente pelo servidor quando o envio
+          real de reservas estiver disponível.
+        </p>
+
+        <form id="booking-form" class="booking-form" novalidate autocomplete="off">
+          <div class="field">
+            <label for="player-name">Nome completo</label>
+            <input
+              id="player-name"
+              type="text"
+              placeholder="Seu nome"
+              maxlength="120"
+              autocomplete="off"
+              aria-describedby="player-name-error"
+              aria-invalid="false"
+              required
+            />
+            <p id="player-name-error" class="field-error" aria-live="polite"></p>
+          </div>
+
+          <div class="field">
+            <label for="player-phone">WhatsApp com DDD</label>
+            <input
+              id="player-phone"
+              type="tel"
+              inputmode="tel"
+              placeholder="(11) 99999-9999"
+              maxlength="20"
+              autocomplete="off"
+              aria-describedby="player-phone-hint player-phone-error"
+              aria-invalid="false"
+              required
+            />
+            <p id="player-phone-hint" class="field-hint">
+              Informe DDD e telefone com 10 ou 11 dígitos.
+            </p>
+            <p id="player-phone-error" class="field-error" aria-live="polite"></p>
+          </div>
+
+          <p class="privacy-note">
+            Estes dados ficam somente neste formulário enquanto ele estiver aberto.
+            Não serão enviados nem salvos.
+          </p>
+
+          <p id="form-feedback" class="form-feedback" role="status" aria-live="polite"></p>
+
+          <button id="validate-booking" class="validate-button" type="button">
+            Conferir preenchimento
+          </button>
+          <button class="payment-disabled" type="button" disabled>
+            Pagamento ainda não habilitado
+          </button>
+        </form>
+      </section>
+    </dialog>
+
+    <dialog
+      id="participants-dialog"
+      class="booking-dialog participants-dialog"
+      aria-labelledby="participants-title"
+      aria-describedby="participants-schedule"
+    >
+      <section class="booking-modal">
+        <header class="modal-header">
+          <div>
+            <p class="eyebrow">Lista de confirmados</p>
+            <h2 id="participants-title" tabindex="-1">Participantes</h2>
+            <p id="participants-schedule" class="participants-schedule"></p>
+          </div>
+          <button
+            id="close-participants"
+            class="icon-button"
+            type="button"
+            aria-label="Fechar participantes"
+          >
+            <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+              <path d="m6 6 12 12M18 6 6 18"></path>
+            </svg>
+          </button>
+        </header>
+        <div
+          id="participants-list"
+          class="participants-list"
+          aria-live="polite"
+          aria-busy="true"
+        >
+          <p class="state-message">Carregando participantes...</p>
+        </div>
+      </section>
+    </dialog>
+
+    <nav class="bottom-nav" aria-label="Navegação principal">
+      <div class="nav-inner">
+        <button id="nav-matches" class="nav-item nav-item-active" type="button" aria-current="page">
+          <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <rect x="3.5" y="5" width="17" height="16" rx="2.5"></rect>
+            <path d="M7.5 3v4M16.5 3v4M3.5 10h17"></path>
+          </svg>
+          <span>Partidas</span>
+        </button>
+        <button class="nav-item" type="button" disabled aria-label="Reservas, indisponível">
+          <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path d="M7 3.5h10a2 2 0 0 1 2 2v15l-7-4-7 4v-15a2 2 0 0 1 2-2Z"></path>
+            <path d="M9 8h6M9 11.5h6"></path>
+          </svg>
+          <span>Reservas</span>
+          <small>Indisponível</small>
+        </button>
+        <button class="nav-item" type="button" disabled aria-label="Ranking, indisponível">
+          <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path d="M8 4h8v4a4 4 0 0 1-8 0V4Z"></path>
+            <path d="M8 6H5v2a4 4 0 0 0 4 4M16 6h3v2a4 4 0 0 1-4 4M12 12v5M8 21h8M9 17h6"></path>
+          </svg>
+          <span>Ranking</span>
+          <small>Indisponível</small>
+        </button>
+        <button id="nav-admin" class="nav-item" type="button" aria-label="Abrir cadastro de partidas">
+          <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path d="M12 3 20 6v5c0 5-3.5 8.5-8 10-4.5-1.5-8-5-8-10V6l8-3Z"></path>
+            <path d="m9 12 2 2 4-4"></path>
+          </svg>
+          <span>Admin</span>
+          <small>Cadastro</small>
+        </button>
+      </div>
+    </nav>
+  </body>
+</html>
