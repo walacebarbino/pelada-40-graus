@@ -7,11 +7,14 @@ import uuid
 
 from storage import (
     DB_PATH,
-    SCHEMA_OBJECTS,
+    SCHEMA_OBJECTS_V2,
+    SCHEMA_OBJECTS_V3,
+    SCHEMA_VERSION_V2,
     SCHEMA_VERSION,
     SCHEMA_VERSION_V1,
     schema_is_current,
     schema_is_version_1,
+    schema_is_version_2,
     schema_matches,
 )
 
@@ -53,11 +56,15 @@ def _validate_integrity(connection: sqlite3.Connection) -> None:
         raise MigrationError("The database contains broken foreign-key relationships.")
 
 
-def _reserve_backup_path(database_path: Path) -> Path:
+def _reserve_backup_path(
+    database_path: Path,
+    source_version: int = SCHEMA_VERSION_V1,
+) -> Path:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     for _ in range(10):
         backup_path = database_path.with_name(
-            f"{database_path.name}.v1-backup-{timestamp}-{uuid.uuid4().hex}.sqlite3"
+            f"{database_path.name}.v{source_version}-backup-"
+            f"{timestamp}-{uuid.uuid4().hex}.sqlite3"
         )
         try:
             with backup_path.open("xb"):
@@ -73,8 +80,9 @@ def _reserve_backup_path(database_path: Path) -> Path:
 def _create_backup(
     database_path: Path,
     expected_snapshot: dict[str, tuple[tuple[object, ...], ...]],
+    source_version: int = SCHEMA_VERSION_V1,
 ) -> Path:
-    backup_path = _reserve_backup_path(database_path)
+    backup_path = _reserve_backup_path(database_path, source_version)
     source = None
     destination = None
     try:
@@ -101,8 +109,15 @@ def _create_backup(
             timeout=5.0,
         )
         try:
-            if not schema_is_version_1(validation):
-                raise MigrationError("The SQLite backup does not match schema version 1.")
+            version_matches = (
+                schema_is_version_1(validation)
+                if source_version == SCHEMA_VERSION_V1
+                else schema_is_version_2(validation)
+            )
+            if not version_matches:
+                raise MigrationError(
+                    f"The SQLite backup does not match schema version {source_version}."
+                )
             _validate_integrity(validation)
             if _snapshot(validation) != expected_snapshot:
                 raise MigrationError("The SQLite backup does not match the source data.")
@@ -129,7 +144,7 @@ def _create_backup(
 
 
 def _rebuild_matches(connection: sqlite3.Connection) -> None:
-    old_sql = SCHEMA_OBJECTS[0][2]
+    old_sql = SCHEMA_OBJECTS_V2[0][2]
     create_new_sql = old_sql.replace(
         "CREATE TABLE matches (",
         "CREATE TABLE matches_migration_new (",
@@ -171,7 +186,7 @@ def _rebuild_matches(connection: sqlite3.Connection) -> None:
     connection.execute(
         "ALTER TABLE matches_migration_new RENAME TO matches"
     )
-    for object_type, name, statement in SCHEMA_OBJECTS:
+    for object_type, name, statement in SCHEMA_OBJECTS_V2:
         if object_type == "index" and name == "idx_matches_status_date":
             connection.execute(statement)
             break
@@ -179,8 +194,16 @@ def _rebuild_matches(connection: sqlite3.Connection) -> None:
         raise MigrationError("The version 2 match index definition is missing.")
 
 
-def _set_schema_version(connection: sqlite3.Connection) -> None:
-    connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+def _set_schema_version(
+    connection: sqlite3.Connection,
+    version: int,
+) -> None:
+    connection.execute(f"PRAGMA user_version = {version}")
+
+
+def _create_v3_objects(connection: sqlite3.Connection) -> None:
+    for _, _, statement in SCHEMA_OBJECTS_V3[len(SCHEMA_OBJECTS_V2):]:
+        connection.execute(statement)
 
 
 def _apply_migration(
@@ -191,14 +214,14 @@ def _apply_migration(
     try:
         _rebuild_matches(connection)
 
-        if not schema_matches(connection, SCHEMA_OBJECTS):
+        if not schema_matches(connection, SCHEMA_OBJECTS_V2):
             raise MigrationError("The rebuilt schema does not match version 2.")
         if _snapshot(connection) != before_snapshot:
             raise MigrationError("The migration changed data that must be preserved.")
         _validate_integrity(connection)
 
-        _set_schema_version(connection)
-        if not schema_is_current(connection):
+        _set_schema_version(connection, SCHEMA_VERSION_V2)
+        if not schema_is_version_2(connection):
             raise MigrationError("The migrated schema version failed verification.")
 
         connection.commit()
@@ -237,8 +260,8 @@ def migrate_database(db_path: str | Path = DB_PATH) -> MigrationResult:
             raise MigrationError("Could not enable foreign-key checks.")
 
         version = connection.execute("PRAGMA user_version").fetchone()[0]
-        if version == SCHEMA_VERSION:
-            if not schema_is_current(connection):
+        if version == SCHEMA_VERSION_V2:
+            if not schema_is_version_2(connection):
                 raise MigrationError("The version 2 database schema is incompatible.")
             _validate_integrity(connection)
             return MigrationResult(database_path, None, True)
@@ -285,28 +308,132 @@ def migrate_database(db_path: str | Path = DB_PATH) -> MigrationResult:
             connection.close()
 
 
+def _apply_v2_to_v3(
+    connection: sqlite3.Connection,
+    before_snapshot: dict[str, tuple[tuple[object, ...], ...]],
+    backup_path: Path,
+) -> None:
+    try:
+        _create_v3_objects(connection)
+
+        if not schema_matches(connection, SCHEMA_OBJECTS_V3):
+            raise MigrationError("The schema does not match version 3.")
+        if _snapshot(connection) != before_snapshot:
+            raise MigrationError("The migration changed data that must be preserved.")
+        _validate_integrity(connection)
+
+        _set_schema_version(connection, SCHEMA_VERSION)
+        if not schema_is_current(connection):
+            raise MigrationError("The migrated schema version failed verification.")
+
+        connection.commit()
+    except Exception:
+        if connection.in_transaction:
+            connection.rollback()
+        raise MigrationError(
+            "Migration failed and was rolled back. "
+            f"The verified backup is preserved at: {backup_path}"
+        ) from None
+
+
+def migrate_v2_to_v3(db_path: str | Path = DB_PATH) -> MigrationResult:
+    try:
+        database_path = Path(db_path).expanduser().resolve()
+        if not database_path.is_file():
+            raise MigrationError("The migration source database does not exist.")
+    except OSError:
+        raise MigrationError("The migration source database is unavailable.") from None
+
+    connection = None
+    try:
+        connection = sqlite3.connect(
+            f"{database_path.as_uri()}?mode=rw",
+            uri=True,
+            timeout=5.0,
+        )
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
+        if connection.execute("PRAGMA foreign_keys").fetchone()[0] != 1:
+            raise MigrationError("Could not enable foreign-key checks.")
+
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        if version == SCHEMA_VERSION:
+            if not schema_is_current(connection):
+                raise MigrationError("The version 3 database schema is incompatible.")
+            _validate_integrity(connection)
+            return MigrationResult(database_path, None, True)
+        if version != SCHEMA_VERSION_V2:
+            raise MigrationError(
+                f"Expected database schema version {SCHEMA_VERSION_V2}; found {version}."
+            )
+
+        connection.execute("BEGIN IMMEDIATE")
+        if not schema_is_version_2(connection):
+            raise MigrationError("The source schema does not match version 2.")
+        _validate_integrity(connection)
+        before_snapshot = _snapshot(connection)
+
+        backup_path = _create_backup(
+            database_path,
+            before_snapshot,
+            source_version=SCHEMA_VERSION_V2,
+        )
+        _apply_v2_to_v3(connection, before_snapshot, backup_path)
+        return MigrationResult(database_path, backup_path, False)
+    except MigrationError:
+        if connection is not None and connection.in_transaction:
+            connection.rollback()
+        raise
+    except sqlite3.Error:
+        if connection is not None and connection.in_transaction:
+            connection.rollback()
+        raise MigrationError(
+            "Migration failed; the source database was not changed."
+        ) from None
+    finally:
+        if connection is not None:
+            if connection.in_transaction:
+                connection.rollback()
+            connection.close()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Explicitly migrate the Pelada SQLite database from schema v1 to v2."
+        description="Explicitly migrate the Pelada SQLite database between schema versions."
     )
-    parser.add_argument(
+    confirmation = parser.add_mutually_exclusive_group(required=True)
+    confirmation.add_argument(
         "--confirm-v1-to-v2",
         action="store_true",
         help="confirm the version 1 to version 2 migration",
     )
+    confirmation.add_argument(
+        "--confirm-v2-to-v3",
+        action="store_true",
+        help="confirm the version 2 to version 3 migration",
+    )
     arguments = parser.parse_args()
-    if not arguments.confirm_v1_to_v2:
-        parser.error("migration requires --confirm-v1-to-v2")
 
     try:
-        result = migrate_database()
+        if arguments.confirm_v1_to_v2:
+            result = migrate_database()
+            target_version = SCHEMA_VERSION_V2
+        else:
+            result = migrate_v2_to_v3()
+            target_version = SCHEMA_VERSION
     except MigrationError as error:
         parser.exit(1, f"Migration failed: {error}\n")
 
     if result.already_current:
-        print(f"Schema v2 validated; no changes made: {result.database_path}")
+        print(
+            f"Schema v{target_version} validated; no changes made: "
+            f"{result.database_path}"
+        )
     else:
-        print(f"Schema v2 migration completed: {result.database_path}")
+        print(
+            f"Schema v{target_version} migration completed: "
+            f"{result.database_path}"
+        )
         print(f"Verified pre-migration backup: {result.backup_path}")
 
 

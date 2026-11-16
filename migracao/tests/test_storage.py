@@ -54,7 +54,10 @@ class StorageTests(unittest.TestCase):
                     """
                 )
             }
-            self.assertEqual(table_names, {"matches", "bookings", "votes"})
+            self.assertEqual(
+                table_names,
+                {"matches", "bookings", "votes", "reservation_operations"},
+            )
             for table_name in table_names:
                 count = connection.execute(
                     f"SELECT COUNT(*) FROM {table_name}"
@@ -115,7 +118,7 @@ class StorageTests(unittest.TestCase):
                     """
                 )
 
-    def test_v2_accepts_fourteen_players_and_rejects_other_limits(self) -> None:
+    def test_v3_accepts_fourteen_players_and_rejects_other_limits(self) -> None:
         initialize_database(self.database_path)
 
         with self.open_database() as connection:

@@ -10,14 +10,16 @@ from migrate_db import (
     _reserve_backup_path,
     _snapshot,
     migrate_database,
+    migrate_v2_to_v3,
 )
 from storage import (
     SCHEMA_OBJECTS_V1,
-    SCHEMA_VERSION,
+    SCHEMA_OBJECTS_V2,
     connect,
     initialize_database,
     schema_is_current,
     schema_is_version_1,
+    schema_is_version_2,
 )
 
 
@@ -69,6 +71,16 @@ class MigrationTests(unittest.TestCase):
             connection.execute("DELETE FROM bookings WHERE id = 88")
             connection.execute(
                 """
+                INSERT INTO bookings (
+                    id, match_id, player_name, player_phone, status, locked_until,
+                    payment_status
+                )
+                VALUES (72, 41, 'Bloqueio antigo', '11922222222', 'bloqueada',
+                        '2030-07-14T20:10:00Z', 'nao_iniciado')
+                """
+            )
+            connection.execute(
+                """
                 INSERT INTO votes (
                     id, match_id, booking_id, category, voter_name
                 )
@@ -89,6 +101,79 @@ class MigrationTests(unittest.TestCase):
         finally:
             connection.close()
 
+    def create_version_2_fixture(self, path: Path | None = None) -> Path:
+        database_path = path or (
+            Path(self.temporary_directory.name) / "v2.sqlite3"
+        )
+        connection = sqlite3.connect(database_path)
+        try:
+            connection.execute("PRAGMA foreign_keys = ON")
+            for _, _, statement in SCHEMA_OBJECTS_V2:
+                connection.execute(statement)
+
+            connection.execute(
+                """
+                INSERT INTO matches (
+                    id, title, match_date, match_time, location, duration_minutes,
+                    max_players, price_per_slot_cents, status, created_at
+                )
+                VALUES
+                    (41, 'Partida A', '2030-07-14', '19:30', 'Quadra A', 60,
+                     12, 1875, 'agendada', '2030-01-01T10:00:00Z'),
+                    (58, 'Partida B', '2030-07-15', '20:00', 'Quadra B', 90,
+                     10, 2500, 'agendada', '2030-01-02T10:00:00Z')
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO bookings (
+                    id, match_id, player_name, player_phone, status, payment_status,
+                    confirmed_at
+                )
+                VALUES (71, 41, 'Jogador A', '11911111111', 'confirmada',
+                        'aprovado', '2030-07-14T18:00:00Z')
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO bookings (id, match_id, status)
+                VALUES (88, 58, 'expirada')
+                """
+            )
+            connection.execute("DELETE FROM bookings WHERE id = 88")
+            connection.execute(
+                """
+                INSERT INTO bookings (
+                    id, match_id, player_name, player_phone, status, locked_until,
+                    payment_status
+                )
+                VALUES (72, 41, 'Bloqueio antigo', '11922222222', 'bloqueada',
+                        '2030-07-14T20:10:00Z', 'nao_iniciado')
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO votes (
+                    id, match_id, booking_id, category, voter_name
+                )
+                VALUES (45, 41, 71, 'gols', 'Votante A')
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO votes (
+                    id, match_id, booking_id, category, voter_name
+                )
+                VALUES (67, 41, 71, 'dribles', 'Votante B')
+                """
+            )
+            connection.execute("DELETE FROM votes WHERE id = 67")
+            connection.execute("PRAGMA user_version = 2")
+            connection.commit()
+        finally:
+            connection.close()
+        return database_path
+
     def snapshot(self, path: Path) -> dict[str, tuple[tuple[object, ...], ...]]:
         connection = sqlite3.connect(path)
         try:
@@ -104,6 +189,13 @@ class MigrationTests(unittest.TestCase):
             connection.close()
 
     def schema_version_2(self, path: Path) -> bool:
+        connection = sqlite3.connect(path)
+        try:
+            return schema_is_version_2(connection)
+        finally:
+            connection.close()
+
+    def schema_version_3(self, path: Path) -> bool:
         connection = sqlite3.connect(path)
         try:
             return schema_is_current(connection)
@@ -268,22 +360,7 @@ class MigrationTests(unittest.TestCase):
 
     def test_v2_rerun_validates_and_preserves_without_new_backup(self) -> None:
         v2_path = Path(self.temporary_directory.name) / "already-v2.sqlite3"
-        initialize_database(v2_path)
-        connection = connect(v2_path)
-        try:
-            connection.execute(
-                """
-                INSERT INTO matches (
-                    title, match_date, match_time, location, duration_minutes,
-                    max_players, price_per_slot_cents
-                )
-                VALUES ('14 jogadores', '2030-07-14', '19:30', 'Quadra A', 60,
-                        14, 1875)
-                """
-            )
-            connection.commit()
-        finally:
-            connection.close()
+        self.create_version_2_fixture(v2_path)
         before = self.snapshot(v2_path)
 
         result = migrate_database(v2_path)
@@ -292,6 +369,181 @@ class MigrationTests(unittest.TestCase):
         self.assertIsNone(result.backup_path)
         self.assertEqual(self.snapshot(v2_path), before)
         self.assertTrue(self.schema_version_2(v2_path))
+
+    def test_v2_to_v3_migration_preserves_rows_and_creates_verified_backup(self) -> None:
+        v2_path = self.create_version_2_fixture()
+        before = self.snapshot(v2_path)
+
+        result = migrate_v2_to_v3(v2_path)
+
+        self.assertFalse(result.already_current)
+        self.assertIsNotNone(result.backup_path)
+        self.assertIn(".v2-backup-", result.backup_path.name)
+        self.assertTrue(result.backup_path.is_file())
+        self.assertTrue(self.schema_version_3(v2_path))
+        self.assertTrue(self.schema_version_2(result.backup_path))
+        self.assertEqual(self.snapshot(v2_path), before)
+        self.assertEqual(self.snapshot(result.backup_path), before)
+
+        connection = connect(v2_path)
+        try:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM reservation_operations"
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(connection.execute("PRAGMA foreign_key_check").fetchall(), [])
+            self.assertEqual(connection.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+        finally:
+            connection.close()
+
+    def test_v1_database_reaches_v3_only_through_both_explicit_migrations(self) -> None:
+        v1_snapshot = self.snapshot(self.database_path)
+        first_result = migrate_database(self.database_path)
+        self.assertFalse(first_result.already_current)
+        self.assertTrue(self.schema_version_2(self.database_path))
+        self.assertEqual(self.snapshot(self.database_path), v1_snapshot)
+
+        second_result = migrate_v2_to_v3(self.database_path)
+        self.assertFalse(second_result.already_current)
+        self.assertTrue(self.schema_version_3(self.database_path))
+        self.assertEqual(self.snapshot(self.database_path), v1_snapshot)
+
+    def test_v2_to_v3_backup_failure_leaves_source_unchanged(self) -> None:
+        v2_path = self.create_version_2_fixture()
+        before = self.snapshot(v2_path)
+        with mock.patch(
+            "migrate_db._create_backup",
+            side_effect=MigrationError("induced backup failure"),
+        ):
+            with self.assertRaises(MigrationError):
+                migrate_v2_to_v3(v2_path)
+
+        self.assertTrue(self.schema_version_2(v2_path))
+        self.assertEqual(self.snapshot(v2_path), before)
+        self.assertEqual(
+            list(Path(self.temporary_directory.name).glob(
+                "v2.sqlite3.v2-backup-*.sqlite3"
+            )),
+            [],
+        )
+
+    def test_invalid_v2_backup_is_removed_and_source_remains_unchanged(self) -> None:
+        v2_path = self.create_version_2_fixture()
+        before = self.snapshot(v2_path)
+        with mock.patch(
+            "migrate_db.schema_is_version_2",
+            side_effect=(True, False),
+        ):
+            with self.assertRaises(MigrationError):
+                migrate_v2_to_v3(v2_path)
+
+        self.assertEqual(self.snapshot(v2_path), before)
+        connection = sqlite3.connect(v2_path)
+        try:
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 2)
+        finally:
+            connection.close()
+        self.assertEqual(
+            list(Path(self.temporary_directory.name).glob(
+                "v2.sqlite3.v2-backup-*.sqlite3"
+            )),
+            [],
+        )
+
+    def test_failure_after_v3_ddl_rolls_back_and_keeps_verified_backup(self) -> None:
+        v2_path = self.create_version_2_fixture()
+        before = self.snapshot(v2_path)
+        from migrate_db import _create_v3_objects
+
+        def create_then_fail(connection: sqlite3.Connection) -> None:
+            _create_v3_objects(connection)
+            raise RuntimeError("induced failure after schema creation")
+
+        with mock.patch(
+            "migrate_db._create_v3_objects",
+            side_effect=create_then_fail,
+        ):
+            with self.assertRaises(MigrationError):
+                migrate_v2_to_v3(v2_path)
+
+        backups = list(
+            Path(self.temporary_directory.name).glob(
+                "v2.sqlite3.v2-backup-*.sqlite3"
+            )
+        )
+        self.assertEqual(len(backups), 1)
+        self.assertTrue(self.schema_version_2(v2_path))
+        self.assertEqual(self.snapshot(v2_path), before)
+        self.assertTrue(self.schema_version_2(backups[0]))
+        self.assertEqual(self.snapshot(backups[0]), before)
+
+    def test_v2_incompatible_schema_is_rejected_without_backup_or_changes(self) -> None:
+        incompatible_path = Path(self.temporary_directory.name) / "bad-v2.sqlite3"
+        connection = sqlite3.connect(incompatible_path)
+        try:
+            connection.execute("CREATE TABLE matches (id INTEGER PRIMARY KEY)")
+            connection.execute("PRAGMA user_version = 2")
+            connection.commit()
+        finally:
+            connection.close()
+
+        with self.assertRaises(MigrationError):
+            migrate_v2_to_v3(incompatible_path)
+
+        connection = sqlite3.connect(incompatible_path)
+        try:
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 2)
+            self.assertEqual(
+                connection.execute(
+                    "SELECT sql FROM sqlite_master WHERE name = 'matches'"
+                ).fetchone()[0],
+                "CREATE TABLE matches (id INTEGER PRIMARY KEY)",
+            )
+        finally:
+            connection.close()
+        self.assertEqual(
+            list(Path(self.temporary_directory.name).glob(
+                "bad-v2.sqlite3.v2-backup-*.sqlite3"
+            )),
+            [],
+        )
+
+    def test_v2_migration_rejects_unexpected_version_without_changes(self) -> None:
+        v2_path = self.create_version_2_fixture()
+        before = self.snapshot(v2_path)
+        connection = sqlite3.connect(v2_path)
+        try:
+            connection.execute("PRAGMA user_version = 9")
+            connection.commit()
+        finally:
+            connection.close()
+
+        with self.assertRaises(MigrationError):
+            migrate_v2_to_v3(v2_path)
+
+        self.assertEqual(self.snapshot(v2_path), before)
+        connection = sqlite3.connect(v2_path)
+        try:
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 9)
+        finally:
+            connection.close()
+        self.assertEqual(
+            list(Path(self.temporary_directory.name).glob(
+                "v2.sqlite3.v2-backup-*.sqlite3"
+            )),
+            [],
+        )
+
+    def test_initializer_rejects_v2_and_requires_explicit_v3_migration(self) -> None:
+        v2_path = self.create_version_2_fixture()
+        before = self.snapshot(v2_path)
+        with self.assertRaisesRegex(RuntimeError, "confirm-v2-to-v3"):
+            initialize_database(v2_path)
+
+        self.assertTrue(self.schema_version_2(v2_path))
+        self.assertEqual(self.snapshot(v2_path), before)
 
     def test_backup_reservation_never_overwrites_an_existing_file(self) -> None:
         fixed_time = mock.Mock()

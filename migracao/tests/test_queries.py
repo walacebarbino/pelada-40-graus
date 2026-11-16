@@ -1,9 +1,14 @@
 from contextlib import contextmanager
 from datetime import datetime, timezone
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
 
+from availability import (
+    IncompatibleAvailabilitySchemaError,
+    occupied_bookings_by_match,
+)
 from queries import (
     DatabaseReadError,
     MatchNotFoundError,
@@ -11,6 +16,11 @@ from queries import (
     list_matches,
 )
 from storage import DB_PATH, connect, initialize_database
+from v2_fixture import (
+    assert_v2_database_unchanged,
+    create_valid_v2_database,
+    snapshot_database,
+)
 
 
 class QueryTests(unittest.TestCase):
@@ -22,6 +32,11 @@ class QueryTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temporary_directory.cleanup()
+
+    def create_v2_database(self) -> Path:
+        return create_valid_v2_database(
+            Path(self.temporary_directory.name) / "valid-v2.sqlite3"
+        )
 
     @contextmanager
     def open_database(self):
@@ -232,3 +247,39 @@ class QueryTests(unittest.TestCase):
 
         with self.assertRaises(DatabaseReadError):
             list_matches(incompatible_path)
+
+    def test_direct_availability_helper_rejects_v2_before_joining_v3_table(self) -> None:
+        database_path = self.create_v2_database()
+        before = snapshot_database(database_path)
+        connection = sqlite3.connect(database_path)
+        try:
+            with self.assertRaises(IncompatibleAvailabilitySchemaError):
+                occupied_bookings_by_match(
+                    connection,
+                    datetime(2030, 7, 14, tzinfo=timezone.utc),
+                )
+        finally:
+            connection.close()
+
+        assert_v2_database_unchanged(self, database_path, before)
+
+    def test_match_listing_rejects_valid_v2_without_modification(self) -> None:
+        database_path = self.create_v2_database()
+        before = snapshot_database(database_path)
+
+        with self.assertRaises(DatabaseReadError):
+            list_matches(
+                database_path,
+                now=datetime(2030, 7, 14, tzinfo=timezone.utc),
+            )
+
+        assert_v2_database_unchanged(self, database_path, before)
+
+    def test_participant_listing_rejects_valid_v2_without_modification(self) -> None:
+        database_path = self.create_v2_database()
+        before = snapshot_database(database_path)
+
+        with self.assertRaises(DatabaseReadError):
+            list_confirmed_participant_names(41, database_path)
+
+        assert_v2_database_unchanged(self, database_path, before)

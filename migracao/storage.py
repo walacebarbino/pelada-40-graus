@@ -7,7 +7,8 @@ MIGRATION_DIR = Path(__file__).resolve().parent
 DATA_DIR = (MIGRATION_DIR / "data").resolve()
 DB_PATH = (DATA_DIR / "pelada_migracao.sqlite3").resolve()
 SCHEMA_VERSION_V1 = 1
-SCHEMA_VERSION = 2
+SCHEMA_VERSION_V2 = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_OBJECTS_V1 = (
     (
@@ -148,7 +149,7 @@ SCHEMA_OBJECTS_V1 = (
     ("index", "idx_votes_booking_match", "CREATE INDEX idx_votes_booking_match ON votes(booking_id, match_id)"),
 )
 
-SCHEMA_OBJECTS = tuple(
+SCHEMA_OBJECTS_V2 = tuple(
     (
         object_type,
         name,
@@ -162,6 +163,52 @@ SCHEMA_OBJECTS = tuple(
     )
     for object_type, name, statement in SCHEMA_OBJECTS_V1
 )
+
+SCHEMA_OBJECTS_V3 = SCHEMA_OBJECTS_V2 + (
+    (
+        "table",
+        "reservation_operations",
+        """
+        CREATE TABLE reservation_operations (
+            booking_id INTEGER PRIMARY KEY,
+            idempotency_hash BLOB NOT NULL UNIQUE
+                CHECK (
+                    typeof(idempotency_hash) = 'blob'
+                    AND length(idempotency_hash) = 32
+                ),
+            recovery_hash BLOB NOT NULL UNIQUE
+                CHECK (
+                    typeof(recovery_hash) = 'blob'
+                    AND length(recovery_hash) = 32
+                ),
+            request_fingerprint BLOB NOT NULL
+                CHECK (
+                    typeof(request_fingerprint) = 'blob'
+                    AND length(request_fingerprint) = 32
+                ),
+            locked_until TEXT NOT NULL
+                CHECK (
+                    typeof(locked_until) = 'text'
+                    AND length(locked_until) >= 20
+                    AND substr(locked_until, -1) = 'Z'
+                ),
+            FOREIGN KEY (booking_id) REFERENCES bookings(id) ON DELETE CASCADE
+        )
+        """,
+    ),
+    (
+        "trigger",
+        "trg_reservation_operations_immutable",
+        """
+        CREATE TRIGGER trg_reservation_operations_immutable
+        BEFORE UPDATE ON reservation_operations
+        BEGIN
+            SELECT RAISE(ABORT, 'reservation operation metadata is immutable');
+        END
+        """,
+    ),
+)
+SCHEMA_OBJECTS = SCHEMA_OBJECTS_V3
 
 
 def connect(db_path: str | Path = DB_PATH) -> sqlite3.Connection:
@@ -217,6 +264,14 @@ def schema_is_version_1(connection: sqlite3.Connection) -> bool:
     )
 
 
+def schema_is_version_2(connection: sqlite3.Connection) -> bool:
+    version = connection.execute("PRAGMA user_version").fetchone()[0]
+    return version == SCHEMA_VERSION_V2 and schema_matches(
+        connection,
+        SCHEMA_OBJECTS_V2,
+    )
+
+
 def initialize_database(db_path: str | Path = DB_PATH) -> Path:
     resolved_path = Path(db_path).expanduser().resolve()
     resolved_path.parent.mkdir(parents=True, exist_ok=True)
@@ -230,6 +285,12 @@ def initialize_database(db_path: str | Path = DB_PATH) -> Path:
             raise RuntimeError(
                 "Schema version 1 requires the explicit migration command "
                 "migrate_db.py --confirm-v1-to-v2."
+            )
+
+        if version == SCHEMA_VERSION_V2:
+            raise RuntimeError(
+                "Schema version 2 requires the explicit migration command "
+                "migrate_db.py --confirm-v2-to-v3."
             )
 
         if version == SCHEMA_VERSION:

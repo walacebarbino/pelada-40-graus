@@ -10,6 +10,7 @@ from pydantic import ValidationError
 
 import main
 from admin import (
+    AdminDatabaseError,
     AdminMatchNotFoundError,
     AdminKeyNotConfiguredError,
     InvalidAdminKeyError,
@@ -23,6 +24,11 @@ from admin import (
 )
 from queries import list_matches
 from storage import DB_PATH, connect, initialize_database
+from v2_fixture import (
+    assert_v2_database_unchanged,
+    create_valid_v2_database,
+    snapshot_database,
+)
 
 
 class AdminTests(unittest.TestCase):
@@ -533,6 +539,24 @@ class AdminTests(unittest.TestCase):
 
         self.assertEqual(conflict.exception.status_code, 409)
         self.assertEqual(self.read_match(match_id), original)
+
+    def test_create_update_and_delete_reject_valid_v2_without_modification(self) -> None:
+        database_path = create_valid_v2_database(
+            Path(self.temporary_directory.name) / "valid-v2.sqlite3"
+        )
+        before = snapshot_database(database_path)
+
+        with self.assertRaises(AdminDatabaseError):
+            create_match(self.valid_match, database_path)
+        assert_v2_database_unchanged(self, database_path, before)
+
+        with self.assertRaises(AdminDatabaseError):
+            update_match(41, self.valid_match, database_path)
+        assert_v2_database_unchanged(self, database_path, before)
+
+        with self.assertRaises(AdminDatabaseError):
+            delete_match(41, database_path)
+        assert_v2_database_unchanged(self, database_path, before)
 
 
 if __name__ == "__main__":

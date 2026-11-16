@@ -4,19 +4,23 @@
 
 - `storage.py`: caminho absoluto do banco novo, conexões com chaves estrangeiras habilitadas e esquemas versionados.
 - `init_db.py`: inicializador explícito; não executa ao importar e exige confirmação.
-- `migrate_db.py`: migração explícita e confirmada de v1 para v2, com backup SQLite verificado.
+- `migrate_db.py`: migrações explícitas e confirmadas v1→v2 e v2→v3, cada uma com backup SQLite verificado.
 - `queries.py`: consultas somente leitura com validação da versão e estrutura do esquema.
 - `tests/`: testes `unittest` isolados em bancos SQLite temporários.
 
-O banco futuro será `migracao/data/pelada_migracao.sqlite3`. Importar os módulos não cria nem inicializa o banco. O inicializador cria um banco v2 somente quando executado com `--confirm-create`; encontrar v1 exige a migração explícita. Não reutiliza `pelada.db` e não insere partidas, reservas, pessoas ou votos de exemplo.
+O banco futuro será `migracao/data/pelada_migracao.sqlite3`. **O banco real ainda não foi migrado para v3.** Importar os módulos não cria, inicializa nem migra o banco. O inicializador cria um banco v3 somente quando executado com `--confirm-create`; encontrar v1 ou v2 exige a migração explícita correspondente. Não reutiliza `pelada.db` e não insere partidas, reservas, pessoas ou votos de exemplo.
+
+O código atual exige esquema v3 para as operações locais de consulta, administração e reserva; bancos v2 são recusados com erros controlados de incompatibilidade. O banco real ainda não foi migrado, e qualquer atualização dele depende de autorização separada.
 
 ## Esquema e decisões
 
-O esquema versão 2 contém `matches`, `bookings` e `votes`, com chaves estrangeiras, índices, estados limitados por `CHECK` e compatibilidade entre a partida de um voto e a partida da reserva votada. `matches.max_players` aceita exatamente 10, 12 ou 14. O número da reserva é independente do nome da pessoa. Valores são armazenados em `price_per_slot_cents` como inteiros; o preço padrão de 1500 centavos corresponde a R$ 15,00. A versão é registrada em `PRAGMA user_version`.
+O esquema versão 3 contém `matches`, `bookings`, `votes` e `reservation_operations`, com chaves estrangeiras, índices, estados limitados por `CHECK` e compatibilidade entre a partida de um voto e a partida da reserva votada. `matches.max_players` aceita exatamente 10, 12 ou 14. O número da reserva é independente do nome da pessoa. Valores são armazenados em `price_per_slot_cents` como inteiros; o preço padrão de 1500 centavos corresponde a R$ 15,00. A versão é registrada em `PRAGMA user_version`.
 
-Estados de reserva: `disponivel`, `bloqueada`, `confirmada` e `expirada`. Uma confirmação exige pagamento `aprovado`; uma reserva bloqueada requer jogador e prazo. Estados de pagamento são separados: `nao_iniciado`, `cobranca_pendente`, `aprovado`, `recusado`, `cancelado` e `expirado`. Criar uma cobrança só pode registrar `cobranca_pendente`; `aprovado` deve depender de confirmação verificável do provedor. Transições futuras previstas: reserva disponível → bloqueada → confirmada após aprovação; bloqueada → expirada → disponível após liberação controlada. Pagamento não iniciado → cobrança pendente → resultado verificado. O serviço interno de bloqueio usa `nao_iniciado`, contabiliza vencimentos sem apagar registros e serializa a verificação de capacidade e inserção com `BEGIN IMMEDIATE`. Não há transição automática do status nem integração com provedor.
+`reservation_operations` mantém uma linha por reserva criada pelo serviço idempotente. `booking_id` é chave primária e chave estrangeira; hashes BLOB de 32 bytes para idempotência e recuperação têm restrições `UNIQUE` e de tipo/tamanho. Um fingerprint HMAC de 32 bytes e o prazo original ficam associados à operação. Um trigger impede atualizar esses metadados. Reservas anteriores à v3 não recebem credenciais retroativas.
 
-Ao encontrar versão ou estrutura incompatível, a inicialização falha sem adaptar nem apagar o banco. A repetição em um esquema v2 compatível valida a estrutura e preserva os dados. Um banco v1 não é migrado pelo inicializador.
+Estados de reserva: `disponivel`, `bloqueada`, `confirmada` e `expirada`. Uma confirmação exige pagamento `aprovado`; uma reserva bloqueada requer jogador e prazo. Estados de pagamento são separados: `nao_iniciado`, `cobranca_pendente`, `aprovado`, `recusado`, `cancelado` e `expirado`. Criar uma cobrança só pode registrar `cobranca_pendente`; `aprovado` deve depender de confirmação verificável do provedor. O serviço interno de bloqueio usa `nao_iniciado`, contabiliza vencimentos sem apagar registros e serializa a verificação de capacidade e inserção com `BEGIN IMMEDIATE`. Não há transição automática do pagamento nem integração com provedor.
+
+Ao encontrar versão ou estrutura incompatível, a inicialização falha sem adaptar nem apagar o banco. Bancos v1 e v2 exigem migrações explícitas; o inicializador não os atualiza.
 
 ## Migração explícita v1 → v2
 
@@ -25,7 +29,7 @@ Antes de migrar o banco real, encerre somente o servidor de migração na porta 
 A partir de `Pelada sob Demanda/migracao/`, execute explicitamente:
 
 ```powershell
-py .\migrate_db.py --confirm-v1-to-v2
+.\.venv\Scripts\python.exe .\migrate_db.py --confirm-v1-to-v2
 ```
 
 O comando exige que a origem exista e corresponda exatamente ao esquema v1. Antes de alterar tabelas, cria um backup consistente usando a API de backup do SQLite, com nome exclusivo no mesmo diretório do banco: `pelada_migracao.sqlite3.v1-backup-<UTC>-<UUID>.sqlite3`. O backup é validado quanto à versão, integridade, relacionamentos e dados; se a criação ou validação falhar, a transformação não começa. O comando imprime o caminho exato do backup. Não substitui backups anteriores. Executado num banco v2 válido, apenas o valida e não recria tabela nem gera outro backup.
@@ -47,15 +51,41 @@ Copy-Item -LiteralPath $backup -Destination $database
 
 O comando de restauração mantém o arquivo anterior no nome `.failed-<data>` e não move nem sobrescreve o backup. Não o use como resposta automática a uma falha: primeiro verifique a mensagem, o estado da origem e o backup.
 
+## Migração explícita v2 → v3
+
+Para chegar de v1 a v3, execute primeiro a migração v1→v2 acima e depois esta migração, cada uma com sua confirmação e backup verificado. A migração v2→v3 aceita somente um arquivo existente com versão e esquema v2 exatos; versão ou estrutura incompatível é rejeitada antes de qualquer alteração. Ela verifica `integrity_check` e `foreign_key_check`, cria um backup exclusivo `*.v2-backup-<UTC>-<UUID>.sqlite3` e valida versão, esquema, integridade, relacionamentos e dados desse backup antes de prosseguir.
+
+Com confirmação explícita, a migração usa `BEGIN IMMEDIATE`, cria somente `reservation_operations` e seu trigger de imutabilidade, confere que partidas, reservas, votos, IDs e sequências foram preservados, valida novamente esquema e integridade, define `user_version=3` e confirma tudo em uma transação. Se a alteração falhar, há rollback e o backup verificado é mantido. Backups existentes nunca são sobrescritos. Um banco já v3 válido é apenas validado, sem novo backup.
+
+Com o ambiente virtual ativado por caminho explícito, o comando é:
+
+```powershell
+.\.venv\Scripts\python.exe .\migrate_db.py --confirm-v2-to-v3
+```
+
+Esse comando ainda **não foi executado contra o banco real**. A migração real continua pendente de autorização específica.
+
 ## API v2
 
 `GET /api/v2/partidas` retorna todas as partidas ordenadas por data, horário e ID, em uma lista JSON. Cada objeto contém `id` (inteiro), `title` (texto), `match_date` (`YYYY-MM-DD`), `match_time` (`HH:MM`), `location` (texto), `duration_minutes`, `max_players`, `price_per_slot_cents`, `vagas_ocupadas` e `vagas_livres` (inteiros), e `status` (texto). `vagas_livres` não fica abaixo de zero. O preço permanece em centavos; o JavaScript divide por 100 somente para apresentá-lo como reais.
 
 `GET /api/v2/partidas/{partida_id}/participantes` retorna `{"partida_id": <inteiro>, "participantes": [<nomes>]}`. Uma partida existente sem confirmados retorna uma lista vazia. Uma partida inexistente retorna 404; banco ausente, incompatível ou erro de leitura retorna 503 genérico, sem caminho interno.
 
-Disponibilidade conta todas as reservas `confirmada` e as `bloqueada` cujo `locked_until` seja posterior ao instante atual. `locked_until` deve ser ISO 8601 UTC terminado em `Z`, com segundos e fração opcional de até seis dígitos. Valores inválidos resultam em erro controlado. Estados `disponivel` e `expirada` não ocupam vaga; a quantidade livre é limitada a zero se o total de ocupadas ultrapassar o limite. A consulta continua somente leitura; o serviço interno usa a mesma regra dentro da transação de criação para evitar exceder a capacidade.
+Disponibilidade conta todas as reservas `confirmada` e as `bloqueada` cujo `locked_until` original seja posterior ao instante atual. Para operações v3, a data original imutável dos metadados é a fonte de verdade; reservas antigas sem metadados usam `bookings.locked_until`. O valor deve ser ISO 8601 UTC terminado em `Z`, com segundos e fração opcional de até seis dígitos. Valores inválidos resultam em erro controlado. Estados `disponivel` e `expirada` não ocupam vaga; a quantidade livre é limitada a zero se o total de ocupadas ultrapassar o limite. A consulta continua somente leitura; o serviço interno usa a mesma regra dentro da transação de criação para evitar exceder a capacidade.
 
 O esquema não tem status de reserva `cancelada`. O suporte a cancelamento de reservas foi adiado; não se interpreta `payment_status='cancelado'` como cancelamento da reserva. Portanto, uma reserva ainda `bloqueada` ocupa vaga enquanto seu prazo for válido, independentemente do status de pagamento.
+
+## Serviço interno idempotente e recuperação
+
+`create_temporary_reservation` é o único caminho de criação de bloqueios. Ele requer uma chave de idempotência e um segredo de recuperação distintos. `generate_reservation_credentials()` gera cada um com `secrets.token_urlsafe(32)`: 32 bytes aleatórios (256 bits), codificados como 43 caracteres Base64 URL-safe sem padding. O chamador precisa guardar ambos com segurança antes de enviar a solicitação e reutilizá-los em uma repetição; não os coloque em URL, logs ou dados de telemetria.
+
+O serviço normaliza o nome removendo espaços externos e aplicando Unicode NFC; normaliza o telefone para dígitos nacionais, removendo um prefixo `55` reconhecido. Um JSON canônico com ID da partida e esses dois valores alimenta um HMAC-SHA-256, usando a chave de idempotência decodificada como chave HMAC. O banco persiste somente esse fingerprint e hashes SHA-256 com separação de domínio das duas credenciais; não duplica nome ou telefone na tabela de metadados. O fingerprint permite comparar retries sem depender dos campos mutáveis de `bookings`; se a chave de idempotência for comprometida, ele também permite testar hipóteses sobre os dados originais.
+
+O banco garante unicidade dos hashes e uma associação um-a-um entre metadados e reserva. Um trigger impede atualizar fingerprint, hashes ou prazo original. A criação do bloqueio e dos metadados ocorre na mesma transação `BEGIN IMMEDIATE`. Uma repetição válida devolve a mesma reserva e o prazo originalmente registrado; chave reutilizada com dados ou segredo diferentes gera conflito genérico. Após o prazo, o resultado informa estado efetivo `expirada`, sem renovar o prazo, alterar reserva/pagamento ou ocupar vaga. Reservas anteriores a v3 não têm metadados e não podem ser recuperadas por este serviço.
+
+`recover_temporary_reservation` autoriza a consulta exclusivamente pelo segredo de recuperação. Retorna somente ID e ID da partida, estado efetivo, prazo original e preço; não retorna nome, telefone nem credenciais. O ID sequencial não autoriza acesso. A comparação das credenciais usa `hmac.compare_digest`.
+
+Este é um serviço interno: **não existem rotas de criação ou recuperação**, a interface pública não foi habilitada e esta entrega não autoriza exposição pública. Ainda não há proteção HTTP contra abuso, limitação de requisições, idempotência de transporte ou fluxo de recuperação no navegador. Idempotência evita duplicar uma mesma operação, mas não impede alguém de criar muitas operações com chaves distintas.
 
 ## Cadastro administrativo local
 
@@ -77,7 +107,7 @@ Essa chave não deve ser colocada em `.env`, no código, no histórico de comand
 
 ## Ambiente Python para migração e testes
 
-A suíte foi executada com CPython 3.15.2 no Windows. Nenhuma outra versão do Python foi testada ou declarada compatível.
+A suíte completa foi executada com CPython 3.15.2 no Windows: 80 testes passaram, sem testes ignorados. Todos usam SQLite temporário; nenhum banco real foi aberto ou migrado. Nenhuma outra versão do Python foi testada ou declarada compatível.
 
 As dependências externas diretas, com as versões usadas, estão em `requirements.txt`. `tzdata` fornece a base IANA necessária para `America/Sao_Paulo` no Windows. `uvicorn`, Streamlit e Mercado Pago não fazem parte deste ambiente de testes; a suíte não inicia servidor nem usa integração de pagamento.
 
@@ -94,20 +124,24 @@ py -3.15 -m venv .venv
 No PowerShell, a partir de `Pelada sob Demanda/migracao/`:
 
 ```powershell
-py .\init_db.py --confirm-create
-py .\migrate_db.py --confirm-v1-to-v2
+.\.venv\Scripts\python.exe .\init_db.py --confirm-create
+.\.venv\Scripts\python.exe .\migrate_db.py --confirm-v1-to-v2
+.\.venv\Scripts\python.exe .\migrate_db.py --confirm-v2-to-v3
 .\.venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py" -v
 ```
 
 ## Ainda não implementado
 
-As rotas proxy antigas continuam disponíveis apenas para comparação; a interface usa exclusivamente a API v2, sem fallback. Cadastro e edição de partidas são as únicas escritas administrativas expostas. Há um serviço interno de bloqueio temporário, mas ainda não existe rota de criação de reserva nem integração com a interface. Ainda não existem exclusão de partidas, votos, suporte a cancelamento de reservas, autenticação definitiva, cobrança ou confirmação de pagamento.
+As rotas proxy antigas continuam disponíveis apenas para comparação; a interface usa exclusivamente a API v2, sem fallback. Cadastro e edição de partidas são as únicas escritas administrativas expostas. O serviço de reserva idempotente e recuperação existe somente como API interna de Python; não há rotas para criação, consulta ou recuperação, nem integração com a interface. Ainda não existem exclusão de partidas, votos, suporte a cancelamento de reservas, autenticação definitiva, cobrança ou confirmação de pagamento.
 
-### Pendências antes da exposição pública do bloqueio
+### Pendências antes de qualquer exposição pública
 
-O serviço interno de bloqueio temporário ainda não está exposto por rota nem conectado à interface. Antes de qualquer exposição pública, implementar e revisar:
+Antes de qualquer exposição pública, implementar e revisar:
 
-- idempotência e prevenção de bloqueios duplicados;
-- recuperação segura de uma reserva sem revelar dados pessoais;
-- autorização para acessar os dados de uma reserva;
-- proteção contra abuso de solicitações de bloqueio.
+- rotas HTTP e testes de contrato, sem expor credenciais ou PII em URLs e logs;
+- geração e armazenamento seguro, no navegador, das credenciais antes do POST para resistir a resposta perdida;
+- autorização e recuperação no cliente, com resposta mínima;
+- proteção contra abuso e limitação de requisições. Idempotência não limita operações com chaves diferentes;
+- revisão de segurança das rotas e da política de expiração antes de conectar a interface.
+
+Esta entrega não migrou nem abriu o banco real e não autoriza exposição pública do bloqueio.
