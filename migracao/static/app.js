@@ -1,10 +1,14 @@
 const matchesContainer = document.querySelector("#matches");
 const matchesPanel = document.querySelector("#matches-panel");
+const reservationsPanel = document.querySelector("#reservations-panel");
 const adminPanel = document.querySelector("#admin-panel");
 const matchesFeedback = document.querySelector("#matches-feedback");
 const adminMatchesContainer = document.querySelector("#admin-matches");
 const navMatchesButton = document.querySelector("#nav-matches");
+const navReservationsButton = document.querySelector("#nav-reservations");
 const navAdminButton = document.querySelector("#nav-admin");
+const savedReservationsContainer = document.querySelector("#saved-reservations");
+const reservationsFeedback = document.querySelector("#reservations-feedback");
 const numberFormatter = new Intl.NumberFormat("pt-BR");
 const currencyFormatter = new Intl.NumberFormat("pt-BR", {
   style: "currency",
@@ -22,7 +26,9 @@ const formFeedback = document.querySelector("#form-feedback");
 const selectedSchedule = document.querySelector("#selected-schedule");
 const selectedPrice = document.querySelector("#selected-price");
 const selectedAvailability = document.querySelector("#selected-availability");
-const validateBookingButton = document.querySelector("#validate-booking");
+const reservationFeatureStatus = document.querySelector("#reservation-feature-status");
+const createReservationButton = document.querySelector("#create-reservation");
+const reservationsHeading = document.querySelector("#reservations-heading");
 const participantsDialog = document.querySelector("#participants-dialog");
 const participantsTitle = document.querySelector("#participants-title");
 const participantsSchedule = document.querySelector("#participants-schedule");
@@ -45,6 +51,12 @@ const adminKeyInput = document.querySelector("#admin-key");
 const adminFeedback = document.querySelector("#admin-feedback");
 const createMatchButton = document.querySelector("#create-match");
 const cancelEditButton = document.querySelector("#cancel-edit");
+const RESERVATION_STORAGE_KEY = "pelada.reservations.v1";
+const RESERVATION_STORAGE_VERSION = 1;
+const CREATE_RESERVATION_PATH = "/api/v2/reservas";
+const RECOVER_RESERVATION_PATH = "/api/v2/reservas/recuperacao";
+const RESERVATION_CAPABILITIES_PATH = "/api/ui-capabilities";
+const RESERVATION_TIMEOUT_MS = 10_000;
 
 let returnFocusTo = null;
 let returnFocusToParticipants = null;
@@ -60,6 +72,15 @@ let pendingDeleteMatchId = null;
 let returnFocusToDelete = null;
 let deletePending = false;
 let deleteNeedsRefresh = false;
+let currentMatches = new Map();
+let reservationHttpEnabled = false;
+let reservationCryptoAvailable = false;
+let reservationStorageAvailable = false;
+let reservationRecordsReadable = true;
+let reservationRequestActive = false;
+let reservationRecords = [];
+let reservationCountdownTimer = null;
+let bookingSucceeded = false;
 
 function showMessage(title, message, canRetry) {
   const card = document.createElement("div");
@@ -432,6 +453,573 @@ async function loadParticipants() {
   }
 }
 
+function setBookingFeedback(message, isError = false) {
+  formFeedback.textContent = message;
+  formFeedback.classList.toggle("form-feedback-error", isError);
+}
+
+function setReservationsFeedback(message, isError = false) {
+  reservationsFeedback.textContent = message;
+  reservationsFeedback.classList.toggle("form-feedback-error", isError);
+}
+
+function checkSessionStorage() {
+  try {
+    const storage = window.sessionStorage;
+    const probeKey = `${RESERVATION_STORAGE_KEY}.probe`;
+    storage.setItem(probeKey, "1");
+    storage.removeItem(probeKey);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function readReservationRecords() {
+  const stored = window.sessionStorage.getItem(RESERVATION_STORAGE_KEY);
+  if (stored === null) {
+    return [];
+  }
+
+  const records = JSON.parse(stored);
+  const valid = Array.isArray(records) && records.every((record) => (
+    record !== null &&
+    typeof record === "object" &&
+    record.version === RESERVATION_STORAGE_VERSION &&
+    Number.isSafeInteger(record.match_id) &&
+    record.match_id > 0 &&
+    typeof record.recovery_secret === "string" &&
+    /^[A-Za-z0-9_-]{43}$/.test(record.recovery_secret) &&
+    ["pending", "uncertain", "waiting", "unavailable", "created"].includes(
+      record.state,
+    ) &&
+    (
+      record.retry_at === null ||
+      (
+        Number.isFinite(record.retry_at) &&
+        Number.isFinite(new Date(record.retry_at).getTime())
+      )
+    ) &&
+    (record.state !== "waiting" || Number.isFinite(record.retry_at)) &&
+    (record.retry_action === null ||
+      record.retry_action === "create" ||
+      record.retry_action === "recover") &&
+    (
+      record.payload === undefined ||
+      (
+        record.payload !== null &&
+        typeof record.payload === "object" &&
+        Number.isSafeInteger(record.payload.match_id) &&
+        record.payload.match_id === record.match_id &&
+        typeof record.payload.player_name === "string" &&
+        record.payload.player_name.length <= 120 &&
+        typeof record.payload.player_phone === "string" &&
+        /^\d{10,24}$/.test(record.payload.player_phone) &&
+        typeof record.idempotency_key === "string" &&
+        /^[A-Za-z0-9_-]{43}$/.test(record.idempotency_key)
+      )
+    )
+  ));
+  if (!valid) {
+    throw new Error("Stored reservation state is invalid.");
+  }
+  return records;
+}
+
+function persistReservationRecords() {
+  try {
+    window.sessionStorage.setItem(
+      RESERVATION_STORAGE_KEY,
+      JSON.stringify(reservationRecords),
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function removeReservationRecord(record) {
+  reservationRecords = reservationRecords.filter(
+    (storedRecord) => storedRecord.recovery_secret !== record.recovery_secret,
+  );
+  const removed = persistReservationRecords();
+  renderSavedReservations();
+  return removed;
+}
+
+function persistAfterReservationSuccess() {
+  if (persistReservationRecords()) {
+    return true;
+  }
+  try {
+    window.sessionStorage.removeItem(RESERVATION_STORAGE_KEY);
+  } catch {
+    return false;
+  }
+  return reservationRecords.length === 0 || persistReservationRecords();
+}
+
+function generateReservationCredential() {
+  const bytes = new Uint8Array(32);
+  window.crypto.getRandomValues(bytes);
+  let binary = "";
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte);
+  }
+  return window.btoa(binary)
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/g, "");
+}
+
+function canCreateReservation() {
+  return (
+    reservationHttpEnabled &&
+    reservationCryptoAvailable &&
+    reservationStorageAvailable &&
+    reservationRecordsReadable
+  );
+}
+
+function updateReservationAvailability() {
+  if (!reservationHttpEnabled) {
+    reservationFeatureStatus.textContent =
+      "Reservas temporárias indisponíveis neste ambiente.";
+  } else if (!reservationStorageAvailable || !reservationRecordsReadable) {
+    reservationFeatureStatus.textContent =
+      "O armazenamento desta sessão não está disponível. Nenhuma reserva será enviada.";
+  } else if (!reservationCryptoAvailable) {
+    reservationFeatureStatus.textContent =
+      "Este navegador não oferece geração segura de credenciais. Nenhuma reserva será enviada.";
+  } else {
+    reservationFeatureStatus.textContent = "";
+  }
+
+  createReservationButton.disabled =
+    !canCreateReservation() || reservationRequestActive || bookingSucceeded;
+  const canRecoverReservations =
+    reservationHttpEnabled &&
+    reservationStorageAvailable &&
+    reservationRecordsReadable;
+  navReservationsButton.disabled = !canRecoverReservations;
+  navReservationsButton.setAttribute(
+    "aria-label",
+    canRecoverReservations ? "Minhas reservas nesta sessão" : "Reservas, indisponível",
+  );
+  const navStatus = navReservationsButton.querySelector("small");
+  if (navStatus) {
+    navStatus.textContent = canRecoverReservations ? "Sessão" : "Indisponível";
+  }
+  closeDialogButton.disabled = reservationRequestActive;
+}
+
+function formatReservationDate(value) {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime())
+    ? "prazo informado pelo servidor"
+    : date.toLocaleString("pt-BR");
+}
+
+function isValidReservationResult(result) {
+  return (
+    result !== null &&
+    typeof result === "object" &&
+    typeof result.status === "string" &&
+    result.status.length > 0 &&
+    result.status.length <= 32 &&
+    typeof result.locked_until === "string" &&
+    Number.isFinite(Date.parse(result.locked_until)) &&
+    Number.isSafeInteger(result.price_per_slot_cents) &&
+    result.price_per_slot_cents >= 0
+  );
+}
+
+async function fetchReservation(path, options) {
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(
+    () => controller.abort(),
+    RESERVATION_TIMEOUT_MS,
+  );
+  try {
+    const response = await fetch(path, {
+      ...options,
+      cache: "no-store",
+      credentials: "omit",
+      redirect: "error",
+      signal: controller.signal,
+    });
+    const result = await response.json().catch(() => null);
+    return { response, result };
+  } finally {
+    window.clearTimeout(timeoutId);
+  }
+}
+
+async function withReservationLock(action) {
+  if (reservationRequestActive) {
+    return false;
+  }
+
+  const run = async () => {
+    reservationRequestActive = true;
+    bookingForm.setAttribute("aria-busy", "true");
+    try {
+      updateReservationAvailability();
+      renderSavedReservations();
+      await action();
+    } finally {
+      reservationRequestActive = false;
+      bookingForm.setAttribute("aria-busy", "false");
+      updateReservationAvailability();
+      renderSavedReservations();
+    }
+  };
+
+  if (navigator.locks && typeof navigator.locks.request === "function") {
+    return navigator.locks.request(
+      "pelada-reservation-http",
+      { mode: "exclusive", ifAvailable: true },
+      async (lock) => {
+        if (!lock) {
+          return false;
+        }
+        await run();
+        return true;
+      },
+    );
+  }
+
+  await run();
+  return true;
+}
+
+function parseRetryAfter(response) {
+  const header = response.headers.get("Retry-After");
+  if (header === null || !/^\d+$/.test(header.trim())) {
+    return null;
+  }
+  const seconds = Number(header);
+  if (!Number.isSafeInteger(seconds) || seconds < 1 || seconds > 86_400) {
+    return null;
+  }
+  return Date.now() + seconds * 1000;
+}
+
+function scheduleReservationRetry(record, response, action) {
+  const retryAt = parseRetryAfter(response);
+  record.state = retryAt === null ? "unavailable" : "waiting";
+  record.retry_at = retryAt;
+  record.retry_action = retryAt === null ? null : action;
+  persistReservationRecords();
+  renderSavedReservations();
+  return retryAt !== null;
+}
+
+function setRetryableError(record, message) {
+  record.state = "uncertain";
+  record.retry_at = null;
+  record.retry_action = "create";
+  persistReservationRecords();
+  renderSavedReservations();
+  setBookingFeedback(message, true);
+  setReservationsFeedback(message, true);
+}
+
+function discardFailedCreation(record, message) {
+  const removed = removeReservationRecord(record);
+  const finalMessage = removed
+    ? message
+    : `${message} Não foi possível atualizar o armazenamento local desta sessão.`;
+  setBookingFeedback(finalMessage, true);
+  setReservationsFeedback(finalMessage, true);
+}
+
+function renderSavedReservations() {
+  if (reservationCountdownTimer !== null) {
+    window.clearTimeout(reservationCountdownTimer);
+    reservationCountdownTimer = null;
+  }
+
+  const content = document.createDocumentFragment();
+  let nextRetryAt = null;
+  if (reservationRecords.length === 0) {
+    const empty = document.createElement("p");
+    empty.className = "state-message";
+    empty.textContent = "Nenhuma reserva foi guardada nesta sessão.";
+    content.append(empty);
+    savedReservationsContainer.replaceChildren(content);
+    savedReservationsContainer.setAttribute("aria-busy", "false");
+    return;
+  }
+
+  for (const record of reservationRecords) {
+    const card = document.createElement("article");
+    card.className = "match-card saved-reservation-card";
+
+    const title = document.createElement("h2");
+    title.className = "saved-reservation-title";
+    const match = currentMatches.get(record.match_id);
+    title.textContent = match
+      ? `${match.title} — ${formatMatchDate(match.match_date)} às ${match.match_time}`
+      : "Partida selecionada";
+
+    const retryAt = Number.isFinite(record.retry_at) ? record.retry_at : null;
+    const waiting = retryAt !== null && retryAt > Date.now();
+    const status = document.createElement("p");
+    status.className = "saved-reservation-status";
+    if (record.state === "created" && record.status === "bloqueada") {
+      status.textContent =
+        `Bloqueio temporário. Prazo informado: ${formatReservationDate(record.locked_until)}.`;
+    } else if (record.state === "created") {
+      status.textContent =
+        `Estado informado pelo servidor. Prazo: ${formatReservationDate(record.locked_until)}.`;
+    } else if (record.state === "waiting") {
+      status.textContent = waiting
+        ? `Aguarde até ${formatReservationDate(new Date(retryAt).toISOString())} para repetir.`
+        : "O prazo de espera terminou. Você pode repetir manualmente.";
+    } else if (record.state === "unavailable") {
+      status.textContent =
+        "Serviço indisponível. Nenhuma repetição automática foi feita.";
+    } else {
+      status.textContent =
+        "O resultado do pedido é incerto. Use a operação salva para repetir com segurança.";
+    }
+
+    const actions = document.createElement("div");
+    actions.className = "saved-reservation-actions";
+
+    if (
+      record.payload !== undefined &&
+      record.idempotency_key &&
+      (record.state === "pending" ||
+        record.state === "uncertain" ||
+        (record.state === "waiting" && record.retry_action === "create"))
+    ) {
+      const retryButton = document.createElement("button");
+      retryButton.className = "retry-button";
+      retryButton.type = "button";
+      retryButton.textContent = waiting
+        ? "Aguardar prazo para repetir"
+        : "Repetir envio seguro";
+      retryButton.setAttribute(
+        "aria-label",
+        `Repetir operação salva para ${title.textContent}`,
+      );
+      retryButton.disabled =
+        waiting || reservationRequestActive || !canCreateReservation();
+      retryButton.addEventListener("click", () => retrySavedCreation(record));
+      actions.append(retryButton);
+    }
+
+    if (record.recovery_secret) {
+      const recoverButton = document.createElement("button");
+      recoverButton.className = "retry-button";
+      recoverButton.type = "button";
+      recoverButton.textContent =
+        waiting && record.state === "waiting" && record.retry_action === "recover"
+          ? "Aguardar prazo para consultar"
+          : "Consultar estado";
+      recoverButton.setAttribute(
+        "aria-label",
+        `Consultar estado de ${title.textContent}`,
+      );
+      recoverButton.disabled =
+        reservationRequestActive ||
+        waiting ||
+        !reservationHttpEnabled ||
+        !reservationStorageAvailable ||
+        !reservationRecordsReadable;
+      recoverButton.addEventListener("click", () => recoverSavedReservation(record));
+      actions.append(recoverButton);
+    }
+
+    card.append(title, status, actions);
+    content.append(card);
+
+    if (waiting && (nextRetryAt === null || retryAt < nextRetryAt)) {
+      nextRetryAt = retryAt;
+    }
+  }
+
+  savedReservationsContainer.replaceChildren(content);
+  savedReservationsContainer.setAttribute("aria-busy", "false");
+  if (nextRetryAt !== null) {
+    reservationCountdownTimer = window.setTimeout(
+      renderSavedReservations,
+      Math.min(nextRetryAt - Date.now(), 2_147_000_000),
+    );
+  }
+}
+
+async function retrySavedCreation(record) {
+  if (
+    !canCreateReservation() ||
+    !record.payload ||
+    !record.idempotency_key ||
+    (Number.isFinite(record.retry_at) && record.retry_at > Date.now())
+  ) {
+    return;
+  }
+  setReservationsFeedback("");
+  try {
+    const acquired = await withReservationLock(() => sendReservationCreation(record));
+    if (!acquired) {
+      setReservationsFeedback(
+        "Há uma solicitação ativa em outra aba. Aguarde antes de repetir.",
+        true,
+      );
+    }
+  } catch {
+    setReservationsFeedback(
+      "Não foi possível iniciar a repetição com segurança. A operação continua guardada.",
+      true,
+    );
+  }
+}
+
+function forgetExpiredReservation(record) {
+  const removed = removeReservationRecord(record);
+  const message = removed
+    ? "O servidor confirmou que o bloqueio expirou. Os dados locais da operação foram removidos."
+    : "O servidor confirmou a expiração, mas o armazenamento local não pôde ser atualizado.";
+  setReservationsFeedback(message, !removed);
+  setBookingFeedback(message, !removed);
+}
+
+async function recoverSavedReservation(record) {
+  if (
+    !reservationHttpEnabled ||
+    !reservationStorageAvailable ||
+    !reservationRecordsReadable ||
+    reservationRequestActive ||
+    (Number.isFinite(record.retry_at) && record.retry_at > Date.now())
+  ) {
+    return;
+  }
+
+  setReservationsFeedback("");
+  try {
+    const acquired = await withReservationLock(async () => {
+      let response;
+      let result;
+      try {
+        const reply = await fetchReservation(RECOVER_RESERVATION_PATH, {
+          method: "GET",
+          headers: {
+            Accept: "application/json",
+            Authorization: `Bearer ${record.recovery_secret}`,
+          },
+        });
+        response = reply.response;
+        result = reply.result;
+      } catch {
+        setReservationsFeedback(
+          "Não foi possível consultar o estado. Você pode tentar novamente manualmente.",
+          true,
+        );
+        return;
+      }
+
+      if (response.status === 200 && isValidReservationResult(result)) {
+        if (result.status === "expirada") {
+          forgetExpiredReservation(record);
+          return;
+        }
+        record.state = "created";
+        record.status = result.status;
+        record.locked_until = result.locked_until;
+        record.price_per_slot_cents = result.price_per_slot_cents;
+        record.retry_at = null;
+        record.retry_action = null;
+        persistReservationRecords();
+        renderSavedReservations();
+        setReservationsFeedback(
+          result.status === "bloqueada"
+            ? `Bloqueio temporário ativo até ${formatReservationDate(result.locked_until)}.`
+            : `Estado consultado. Prazo informado: ${formatReservationDate(result.locked_until)}.`,
+        );
+        return;
+      }
+
+      if (response.status === 404) {
+        setReservationsFeedback(
+          "Não foi possível localizar uma operação com os dados guardados nesta sessão.",
+          true,
+        );
+        return;
+      }
+      if (response.status === 429 || response.status === 503) {
+        const retryScheduled = scheduleReservationRetry(record, response, "recover");
+        setReservationsFeedback(
+          retryScheduled
+            ? response.status === 429
+              ? "Limite temporário atingido. Aguarde o prazo antes de consultar novamente."
+              : "O serviço está temporariamente indisponível. Aguarde o prazo antes de consultar novamente."
+            : "O serviço está temporariamente indisponível. Nenhuma repetição automática foi feita.",
+          true,
+        );
+        return;
+      }
+      setReservationsFeedback(
+        "Não foi possível consultar o estado. Nenhum detalhe interno foi exibido.",
+        true,
+      );
+    });
+    if (!acquired) {
+      setReservationsFeedback(
+        "Há uma solicitação ativa em outra aba. Aguarde antes de consultar.",
+        true,
+      );
+    }
+  } catch {
+    setReservationsFeedback(
+      "Não foi possível iniciar a consulta com segurança.",
+      true,
+    );
+  }
+}
+
+async function initializeReservationInterface() {
+  reservationCryptoAvailable =
+    Boolean(window.crypto) &&
+    typeof window.crypto.getRandomValues === "function" &&
+    typeof window.btoa === "function" &&
+    typeof window.TextEncoder === "function" &&
+    typeof window.AbortController === "function";
+  reservationStorageAvailable = checkSessionStorage();
+  if (reservationStorageAvailable) {
+    try {
+      reservationRecords = readReservationRecords();
+    } catch {
+      reservationRecordsReadable = false;
+    }
+  }
+
+  try {
+    const reply = await fetchReservation(RESERVATION_CAPABILITIES_PATH, {
+      headers: { Accept: "application/json" },
+    });
+    const response = reply.response;
+    const capabilities = reply.result;
+    if (
+      !response.ok ||
+      capabilities === null ||
+      typeof capabilities !== "object" ||
+      typeof capabilities.reservation_http_enabled !== "boolean"
+    ) {
+      throw new Error("Reservation capability is unavailable.");
+    }
+    reservationHttpEnabled = capabilities.reservation_http_enabled;
+  } catch {
+    reservationHttpEnabled = false;
+    reservationFeatureStatus.textContent =
+      "Não foi possível confirmar a disponibilidade. Nenhuma reserva será enviada.";
+  }
+
+  updateReservationAvailability();
+  renderSavedReservations();
+}
+
 function setFieldError(input, errorElement, message) {
   errorElement.textContent = message;
   input.setAttribute("aria-invalid", String(message.length > 0));
@@ -440,7 +1028,11 @@ function setFieldError(input, errorElement, message) {
 function validateBookingForm() {
   const name = playerNameInput.value.trim();
   const phoneDigits = playerPhoneInput.value.replace(/\D/g, "");
-  const nameMessage = name ? "" : "Informe seu nome completo.";
+  const nameMessage = !name
+    ? "Informe seu nome completo."
+    : name.length > 120
+      ? "O nome deve ter até 120 caracteres."
+      : "";
   let phoneMessage = "";
 
   if (!phoneDigits) {
@@ -454,25 +1046,232 @@ function validateBookingForm() {
   setFieldError(playerNameInput, playerNameError, nameMessage);
   setFieldError(playerPhoneInput, playerPhoneError, phoneMessage);
 
-  const isValid = !nameMessage && !phoneMessage;
-  if (isValid) {
-    formFeedback.textContent =
-      "Preenchimento válido somente nesta tela. Nada foi enviado ou salvo.";
+  const isValid =
+    !nameMessage &&
+    !phoneMessage &&
+    Number.isSafeInteger(selectedBookingMatchId) &&
+    selectedBookingMatchId > 0;
+  if (!isValid && !nameMessage && !phoneMessage) {
+    setBookingFeedback("Selecione novamente uma partida.", true);
+  } else if (!isValid) {
+    setBookingFeedback("");
   } else {
-    formFeedback.textContent = "";
+    setBookingFeedback("");
+  }
+
+  if (!isValid) {
     if (nameMessage) {
       playerNameInput.focus();
-    } else {
+    } else if (phoneMessage) {
       playerPhoneInput.focus();
     }
   }
   return isValid;
 }
 
+async function sendReservationCreation(record) {
+  let response;
+  let result;
+  try {
+    const reply = await fetchReservation(CREATE_RESERVATION_PATH, {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        "Idempotency-Key": record.idempotency_key,
+        Authorization: `Bearer ${record.recovery_secret}`,
+      },
+      body: JSON.stringify(record.payload),
+    });
+    response = reply.response;
+    result = reply.result;
+  } catch {
+    setRetryableError(
+      record,
+      "Não foi possível confirmar a resposta. Repita manualmente a operação salva; os mesmos dados serão usados.",
+    );
+    return;
+  }
+
+  if (response.status === 200) {
+    if (!isValidReservationResult(result)) {
+      setRetryableError(
+        record,
+        "A resposta não pôde ser confirmada. Repita manualmente a operação salva.",
+      );
+      return;
+    }
+    if (result.status === "expirada") {
+      bookingSucceeded = true;
+      playerNameInput.value = "";
+      playerPhoneInput.value = "";
+      setFieldError(playerNameInput, playerNameError, "");
+      setFieldError(playerPhoneInput, playerPhoneError, "");
+      forgetExpiredReservation(record);
+      updateReservationAvailability();
+      return;
+    }
+
+    record.state = "created";
+    record.status = result.status;
+    record.locked_until = result.locked_until;
+    record.price_per_slot_cents = result.price_per_slot_cents;
+    record.retry_at = null;
+    record.retry_action = null;
+    delete record.idempotency_key;
+    delete record.payload;
+    bookingSucceeded = true;
+    playerNameInput.value = "";
+    playerPhoneInput.value = "";
+    setFieldError(playerNameInput, playerNameError, "");
+    setFieldError(playerPhoneInput, playerPhoneError, "");
+    updateReservationAvailability();
+    if (!persistAfterReservationSuccess()) {
+      setBookingFeedback(
+        "O servidor respondeu, mas não foi possível atualizar o armazenamento da sessão. Consulte o estado em Minhas reservas.",
+        true,
+      );
+    } else {
+      setBookingFeedback(
+        `Bloqueio temporário solicitado. Consulte o estado até ${formatReservationDate(result.locked_until)}.`,
+      );
+    }
+    setReservationsFeedback("");
+    renderSavedReservations();
+    return;
+  }
+
+  const code = result?.error?.code;
+  if (response.status === 429 || response.status === 503) {
+    const retryScheduled = scheduleReservationRetry(record, response, "create");
+    const message = retryScheduled
+      ? response.status === 429
+        ? "Limite temporário atingido. Aguarde o prazo indicado e repita a mesma operação."
+        : "O serviço está temporariamente indisponível. Aguarde o prazo antes de repetir."
+      : "O serviço está temporariamente indisponível. Nenhuma repetição automática foi feita.";
+    setBookingFeedback(message, true);
+    setReservationsFeedback(message, true);
+    return;
+  }
+  if (response.status === 500) {
+    setRetryableError(
+      record,
+      "O resultado não pôde ser confirmado. Você pode repetir manualmente a operação salva.",
+    );
+    return;
+  }
+  if (response.status === 404 && code === "match_not_found") {
+    discardFailedCreation(
+      record,
+      "A partida não está mais disponível. Atualize a lista antes de tentar novamente.",
+    );
+    return;
+  }
+  if (response.status === 409) {
+    const message = code === "no_vacancy"
+      ? "Não há mais vaga nesta partida."
+      : code === "match_unavailable"
+        ? "Esta partida não está disponível para bloqueio."
+        : "Não foi possível confirmar esta solicitação. Nenhuma nova operação foi criada.";
+    discardFailedCreation(record, message);
+    return;
+  }
+  if (response.status === 422) {
+    discardFailedCreation(record, "Confira o nome e o telefone e tente novamente.");
+    return;
+  }
+  if ([403, 413, 415, 431].includes(response.status)) {
+    discardFailedCreation(
+      record,
+      "A solicitação não pôde ser aceita neste ambiente. Nenhum detalhe interno foi exibido.",
+    );
+    return;
+  }
+
+  setRetryableError(
+    record,
+    "Não foi possível confirmar o resultado. Repita manualmente usando a operação salva.",
+  );
+}
+
+async function submitBooking(event) {
+  event.preventDefault();
+  validationAttempted = true;
+  if (!validateBookingForm() || !canCreateReservation() || reservationRequestActive) {
+    return;
+  }
+
+  const existingPending = reservationRecords.find(
+    (record) =>
+      record.match_id === selectedBookingMatchId &&
+      record.payload !== undefined,
+  );
+  if (existingPending) {
+    setBookingFeedback(
+      "Já existe um pedido não confirmado para esta partida. Consulte Minhas reservas e repita a operação salva.",
+      true,
+    );
+    return;
+  }
+
+  const payload = {
+    match_id: selectedBookingMatchId,
+    player_name: playerNameInput.value.trim(),
+    player_phone: playerPhoneInput.value.replace(/\D/g, ""),
+  };
+  if (new TextEncoder().encode(JSON.stringify(payload)).length >= 4096) {
+    setBookingFeedback("A solicitação excede o tamanho permitido.", true);
+    return;
+  }
+
+  try {
+    const acquired = await withReservationLock(async () => {
+      const record = {
+        version: RESERVATION_STORAGE_VERSION,
+        match_id: payload.match_id,
+        idempotency_key: generateReservationCredential(),
+        recovery_secret: generateReservationCredential(),
+        payload,
+        state: "pending",
+        retry_at: null,
+        retry_action: "create",
+        status: null,
+        locked_until: null,
+        price_per_slot_cents: null,
+      };
+      reservationRecords.push(record);
+      if (!persistReservationRecords()) {
+        reservationRecords.pop();
+        setBookingFeedback(
+          "Não foi possível guardar os dados nesta sessão. Por segurança, nada foi enviado.",
+          true,
+        );
+        return;
+      }
+
+      renderSavedReservations();
+      setBookingFeedback("Enviando solicitação de bloqueio temporário.");
+      await sendReservationCreation(record);
+    });
+    if (!acquired) {
+      setBookingFeedback(
+        "Há uma solicitação ativa em outra aba. Aguarde e tente novamente.",
+        true,
+      );
+    }
+  } catch {
+    setBookingFeedback(
+      "Não foi possível iniciar a solicitação com segurança. Nada foi enviado.",
+      true,
+    );
+  }
+}
+
 function openBookingForm(match, trigger) {
   returnFocusTo = trigger;
   selectedBookingMatchId = match.id;
   validationAttempted = false;
+  bookingSucceeded = false;
 
   selectedSchedule.textContent = match.match_time;
   selectedPrice.textContent = currencyFormatter.format(match.price_per_slot_cents / 100);
@@ -481,16 +1280,17 @@ function openBookingForm(match, trigger) {
     `${numberFormatter.format(match.max_players)} vagas livres`;
   playerNameInput.value = "";
   playerPhoneInput.value = "";
-  formFeedback.textContent = "";
+  setBookingFeedback("");
   setFieldError(playerNameInput, playerNameError, "");
   setFieldError(playerPhoneInput, playerPhoneError, "");
+  updateReservationAvailability();
 
   bookingDialog.showModal();
   bookingTitle.focus();
 }
 
 function closeBookingForm() {
-  if (bookingDialog.open) {
+  if (bookingDialog.open && !reservationRequestActive) {
     bookingDialog.close();
   }
 }
@@ -499,10 +1299,12 @@ function resetBookingForm() {
   selectedBookingMatchId = null;
   playerNameInput.value = "";
   playerPhoneInput.value = "";
-  formFeedback.textContent = "";
+  setBookingFeedback("");
   setFieldError(playerNameInput, playerNameError, "");
   setFieldError(playerPhoneInput, playerPhoneError, "");
   validationAttempted = false;
+  bookingSucceeded = false;
+  updateReservationAvailability();
 }
 
 closeDialogButton.addEventListener("click", closeBookingForm);
@@ -549,15 +1351,7 @@ function updateValidationAfterInput() {
 
 playerNameInput.addEventListener("input", updateValidationAfterInput);
 playerPhoneInput.addEventListener("input", updateValidationAfterInput);
-validateBookingButton.addEventListener("click", () => {
-  validationAttempted = true;
-  validateBookingForm();
-});
-bookingForm.addEventListener("submit", (event) => {
-  event.preventDefault();
-  validationAttempted = true;
-  validateBookingForm();
-});
+bookingForm.addEventListener("submit", submitBooking);
 
 function showAdminLoading() {
   currentAdminMatches = new Map();
@@ -614,6 +1408,7 @@ async function refreshMatchLists() {
 
   try {
     const partidas = await fetchMatchData();
+    currentMatches = new Map(partidas.map((partida) => [partida.id, partida]));
     if (partidas.length === 0) {
       showMessage(
         "Nenhuma partida disponível",
@@ -630,6 +1425,7 @@ async function refreshMatchLists() {
     }
 
     renderAdminMatches(partidas);
+    renderSavedReservations();
     return true;
   } catch {
     showMessage(
@@ -1017,18 +1813,32 @@ function setAdminPending(pending) {
 
 function setActiveView(view) {
   const showAdmin = view === "admin";
-  matchesPanel.hidden = showAdmin;
+  const showReservations = view === "reservations";
+  matchesPanel.hidden = showAdmin || showReservations;
+  reservationsPanel.hidden = !showReservations;
   adminPanel.hidden = !showAdmin;
-  navMatchesButton.classList.toggle("nav-item-active", !showAdmin);
+  navMatchesButton.classList.toggle(
+    "nav-item-active",
+    !showAdmin && !showReservations,
+  );
+  navReservationsButton.classList.toggle("nav-item-active", showReservations);
   navAdminButton.classList.toggle("nav-item-active", showAdmin);
 
   if (showAdmin) {
     navAdminButton.setAttribute("aria-current", "page");
     navMatchesButton.removeAttribute("aria-current");
+    navReservationsButton.removeAttribute("aria-current");
     document.querySelector("#admin-heading").focus();
     loadAdminMatches();
+  } else if (showReservations) {
+    navReservationsButton.setAttribute("aria-current", "page");
+    navMatchesButton.removeAttribute("aria-current");
+    navAdminButton.removeAttribute("aria-current");
+    reservationsHeading.focus();
+    renderSavedReservations();
   } else {
     navMatchesButton.setAttribute("aria-current", "page");
+    navReservationsButton.removeAttribute("aria-current");
     navAdminButton.removeAttribute("aria-current");
     setCreateMode();
     clearAdminKey();
@@ -1229,6 +2039,11 @@ adminForm.addEventListener("change", () => {
 });
 adminForm.addEventListener("submit", submitAdminForm);
 navMatchesButton.addEventListener("click", () => setActiveView("matches"));
+navReservationsButton.addEventListener(
+  "click",
+  () => setActiveView("reservations"),
+);
 navAdminButton.addEventListener("click", () => setActiveView("admin"));
 
 loadMatches();
+initializeReservationInterface();

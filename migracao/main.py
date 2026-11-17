@@ -5,7 +5,7 @@ from typing import Any
 
 import requests
 from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from admin import (
@@ -41,9 +41,20 @@ PARTICIPANTS_API_URL = "http://127.0.0.1:8000/participantes/{partida_id}"
 PARTIDA_FIELDS = ("id", "horario", "vagas_totais", "vagas_livres", "preco")
 UPSTREAM_ERROR = "Não foi possível carregar as partidas. Tente novamente."
 PARTICIPANTS_ERROR = "Não foi possível carregar os participantes. Tente novamente."
+RESERVATION_HTTP_ENABLED = reservation_http_enabled(
+    os.environ.get("PELADA_RESERVATION_HTTP_ENABLED")
+)
 
 app = FastAPI(title="Pelada - Interface local")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
+@app.get("/api/ui-capabilities")
+def ui_capabilities() -> JSONResponse:
+    return JSONResponse(
+        {"reservation_http_enabled": RESERVATION_HTTP_ENABLED},
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 def invalid_upstream_response() -> HTTPException:
@@ -271,9 +282,7 @@ def excluir_partida_v2(
     return Response(status_code=204)
 
 
-if reservation_http_enabled(
-    os.environ.get("PELADA_RESERVATION_HTTP_ENABLED")
-):
+if RESERVATION_HTTP_ENABLED:
     configure_reservation_http(
         app,
         enabled=True,

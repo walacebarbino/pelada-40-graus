@@ -10,6 +10,11 @@
   </head>
   <body>
     <div class="top-accent" aria-hidden="true"></div>
+    <noscript>
+      <p class="noscript-note">
+        Ative JavaScript para consultar partidas e solicitar ou acompanhar um bloqueio temporário.
+      </p>
+    </noscript>
     <main class="page">
       <div id="matches-panel">
         <header class="page-header">
@@ -42,10 +47,27 @@
         </section>
 
         <p class="availability-note">
-          O formulário de reserva é apenas local. Envio de reservas, pagamentos e
-          ranking ainda não estão disponíveis.
+          A disponibilidade é informativa; o servidor verifica a vaga no envio e,
+          se disponível, cria um bloqueio temporário.
         </p>
       </div>
+
+      <section id="reservations-panel" hidden aria-labelledby="reservations-heading">
+        <header class="page-header">
+          <p class="eyebrow">Acompanhamento</p>
+          <h1 id="reservations-heading" tabindex="-1">Minhas reservas</h1>
+          <p class="intro">
+            Consulte ou repita com segurança operações guardadas nesta sessão.
+          </p>
+        </header>
+        <p id="reservations-feedback" class="form-feedback" role="status" aria-live="polite"></p>
+        <div
+          id="saved-reservations"
+          class="matches"
+          aria-live="polite"
+          aria-busy="false"
+        ></div>
+      </section>
 
       <section id="admin-panel" hidden aria-labelledby="admin-heading">
         <header class="page-header">
@@ -250,7 +272,7 @@
       id="booking-dialog"
       class="booking-dialog"
       aria-labelledby="booking-title"
-      aria-describedby="availability-note"
+      aria-describedby="availability-note reservation-feature-status"
     >
       <section class="booking-modal">
         <header class="modal-header">
@@ -286,8 +308,16 @@
         </div>
 
         <p id="availability-note" class="availability-reminder">
-          A disponibilidade será verificada novamente pelo servidor quando o envio
-          real de reservas estiver disponível.
+          A disponibilidade exibida é informativa. O servidor verifica a vaga no envio
+          e, se disponível, cria um bloqueio temporário.
+        </p>
+        <p
+          id="reservation-feature-status"
+          class="form-feedback"
+          role="status"
+          aria-live="polite"
+        >
+          Verificando disponibilidade do serviço.
         </p>
 
         <form id="booking-form" class="booking-form" novalidate autocomplete="off">
@@ -326,17 +356,16 @@
           </div>
 
           <p class="privacy-note">
-            Estes dados ficam somente neste formulário enquanto ele estiver aberto.
-            Não serão enviados nem salvos.
+            Nome e telefone serão enviados para solicitar o bloqueio. Antes do envio,
+            ficam guardados em sessionStorage para permitir uma repetição segura se a
+            resposta for incerta; após sucesso, esses dados são removidos. As credenciais
+            não são exibidas.
           </p>
 
           <p id="form-feedback" class="form-feedback" role="status" aria-live="polite"></p>
 
-          <button id="validate-booking" class="validate-button" type="button">
-            Conferir preenchimento
-          </button>
-          <button class="payment-disabled" type="button" disabled>
-            Pagamento ainda não habilitado
+          <button id="create-reservation" class="validate-button" type="submit" disabled>
+            Solicitar bloqueio temporário
           </button>
         </form>
       </section>
@@ -386,7 +415,13 @@
           </svg>
           <span>Partidas</span>
         </button>
-        <button class="nav-item" type="button" disabled aria-label="Reservas, indisponível">
+        <button
+          id="nav-reservations"
+          class="nav-item"
+          type="button"
+          disabled
+          aria-label="Reservas, indisponível"
+        >
           <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
             <path d="M7 3.5h10a2 2 0 0 1 2 2v15l-7-4-7 4v-15a2 2 0 0 1 2-2Z"></path>
             <path d="M9 8h6M9 11.5h6"></path>

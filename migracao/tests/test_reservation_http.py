@@ -895,6 +895,22 @@ class ReservationHTTPContractTests(unittest.IsolatedAsyncioTestCase):
                     os.environ.pop(feature_flag, None)
                     app_module = importlib.import_module("main")
                     self.assertEqual(registered_reservation_routes(app_module.app), set())
+                    async with httpx.AsyncClient(
+                        transport=httpx.ASGITransport(app=app_module.app),
+                        base_url="http://testserver",
+                    ) as capability_client:
+                        capability_response = await capability_client.get(
+                            "/api/ui-capabilities"
+                        )
+                    self.assertEqual(capability_response.status_code, 200)
+                    self.assertEqual(
+                        capability_response.json(),
+                        {"reservation_http_enabled": False},
+                    )
+                    self.assertEqual(
+                        capability_response.headers["cache-control"],
+                        "no-store",
+                    )
                     async with app_module.app.router.lifespan_context(
                         app_module.app
                     ):
@@ -916,6 +932,22 @@ class ReservationHTTPContractTests(unittest.IsolatedAsyncioTestCase):
                             ("/api/v2/reservas", "POST"),
                             ("/api/v2/reservas/recuperacao", "GET"),
                         },
+                    )
+                    async with httpx.AsyncClient(
+                        transport=httpx.ASGITransport(app=app_module.app),
+                        base_url="http://testserver",
+                    ) as capability_client:
+                        capability_response = await capability_client.get(
+                            "/api/ui-capabilities"
+                        )
+                    self.assertEqual(capability_response.status_code, 200)
+                    self.assertEqual(
+                        capability_response.json(),
+                        {"reservation_http_enabled": True},
+                    )
+                    self.assertEqual(
+                        capability_response.headers["cache-control"],
+                        "no-store",
                     )
                     async with app_module.app.router.lifespan_context(
                         app_module.app

@@ -85,7 +85,7 @@ O banco garante unicidade dos hashes e uma associação um-a-um entre metadados 
 
 `recover_temporary_reservation` autoriza a consulta exclusivamente pelo segredo de recuperação. Retorna somente ID e ID da partida, estado efetivo, prazo original e preço; não retorna nome, telefone nem credenciais. O ID sequencial não autoriza acesso. A comparação das credenciais usa `hmac.compare_digest`.
 
-Este é um serviço interno: as rotas HTTP abaixo estão desabilitadas por padrão, a interface não foi conectada e esta entrega não autoriza exposição pública. Há somente limitação provisória em memória, insuficiente contra abuso distribuído; a interface ainda não guarda credenciais nem implementa retries ou recuperação no navegador. Idempotência evita duplicar uma mesma operação, mas não impede alguém de criar muitas operações com chaves distintas.
+Este é um serviço interno: as rotas HTTP abaixo e o envio pela interface estão desabilitados por padrão; esta entrega não autoriza exposição pública. Há somente limitação provisória em memória, insuficiente contra abuso distribuído. A interface integrada guarda credenciais apenas em `sessionStorage` durante a sessão e não implementa pagamentos. Idempotência evita duplicar uma mesma operação, mas não impede alguém de criar muitas operações com chaves distintas.
 
 ## Contrato HTTP de reserva (desabilitado por padrão)
 
@@ -103,7 +103,7 @@ As rotas chamam o serviço interno existente em uma thread de trabalho, injetand
 
 Uma criação e um replay válido retornam HTTP 200 com somente `status`, `locked_until` e `price_per_slot_cents`. Não retornam IDs, nome, telefone ou credenciais. O prazo é sempre o original; um retry não o renova. Se a chave válida já estiver associada a uma operação, o serviço a procura antes de aplicar as condições exclusivas de uma nova reserva. Dados ou segredo diferentes resultam em conflito genérico, inclusive quando o payload não é semanticamente válido.
 
-O cliente deve gerar e guardar as duas credenciais independentes e o corpo normalizado antes do primeiro envio. Em timeout ou resposta incerta, deve repetir o mesmo corpo com as mesmas credenciais, sem gerar outra operação automaticamente. A rota não aceita credenciais em URL. A interface ainda não implementa esse protocolo.
+O cliente gera e guarda as duas credenciais independentes e o corpo normalizado antes do primeiro envio. Em timeout ou resposta incerta, permite repetir o mesmo corpo com as mesmas credenciais, sem retry automático nem geração de outra operação. A rota não aceita credenciais em URL.
 
 A quota é verificada primeiro; em seguida, a chave de idempotência precisa ter formato válido. Para uma chave válida, erros de tipo de conteúdo, JSON, estrutura, campos ou segredo são encaminhados ao serviço, que procura a operação antes da validação de uma nova reserva. Assim, uma chave já usada recebe 409 genérico mesmo com esses outros dados inválidos. Para uma chave ainda não usada, tipo de conteúdo incorreto recebe 415 e dados inválidos recebem 422.
 
@@ -142,6 +142,18 @@ Cada tentativa que chega ao handler de criação consome quota, incluindo replay
 Entradas inativas expiram após a janela correspondente, com limpeza preguiçosa no próximo consumo. O mapa é protegido por lock de thread e limitado a 10.000 entradas por padrão. Quando atinge a capacidade, o limitador expulsa a entrada menos recentemente usada e aceita a nova chave; isso pode permitir evasão das quotas anteriores.
 
 Esse limitador não é distribuído: workers têm contadores independentes e reinícios os apagam. Usuários atrás de NAT podem compartilhar a quota; atrás de proxy, o endereço observado pode representar todos os clientes. O código não confia em `X-Forwarded-For`. Idempotência, o limitador processual e controles do cliente não bastam para prevenir abuso com chaves diferentes. **Não é proteção para exposição pública**: ela continua bloqueada até revisão dos limites de borda, configuração de proxies confiáveis e implantação.
+
+### Integração da interface
+
+A interface estática usa as rotas relativas da mesma origem. Antes de habilitar o formulário, consulta `GET /api/ui-capabilities`, que retorna somente `reservation_http_enabled` (`true` ou `false`) com `Cache-Control: no-store`; não expõe valores de ambiente nem credenciais. O sinal e o registro das rotas usam a mesma configuração do servidor. Sem `PELADA_RESERVATION_HTTP_ENABLED=1`, o sinal é falso e a interface não chama as rotas de reserva.
+
+O navegador gera as credenciais com Web Crypto e guarda o registro versionado em `sessionStorage` antes do POST. Se Web Crypto ou o armazenamento de sessão não estiver disponível, o envio fica desabilitado. Em resposta incerta, a repetição é manual e reutiliza exatamente os mesmos cabeçalhos e payload. Após sucesso, nome, telefone e chave de idempotência são removidos; o segredo de recuperação permanece oculto em `sessionStorage` até o fim da sessão. Por decisão de escopo, não há exibição nem cópia do segredo; portanto, não há garantia de recuperação depois que a sessão da aba termina. `sessionStorage` não é um cofre contra scripts comprometidos da mesma origem.
+
+O navegador usa Web Locks para impedir requisições simultâneas entre abas quando a API está disponível. Sem ela, o bloqueio de duplicidade vale apenas dentro da aba atual; segredos nunca são compartilhados entre abas. Timeout de 10 segundos não dispara retry automático. `429` e `503` permitem retry manual após `Retry-After`; `503` sem esse cabeçalho não oferece retry da criação.
+
+A aplicação não habilita CORS no frontend. Configure no servidor a origem exata usada pelo navegador em `PELADA_RESERVATION_ALLOWED_ORIGINS`; origem ausente é aceita pelo middleware, mas não autentica, e `null` ou origem não autorizada são recusadas. O formulário e a recuperação não colocam credenciais em URL, não as imprimem no console e não mostram respostas internas.
+
+Não há harness de testes JavaScript/browser no repositório. A suíte Python testa o sinal ASGI, mas não executa o código do navegador; testes de UI (fluxos, recarga, erros, Web Locks e acessibilidade) continuam pendentes, sem instalar framework nesta entrega.
 
 ## Cadastro administrativo local
 
@@ -188,15 +200,14 @@ No PowerShell, a partir de `Pelada sob Demanda/migracao/`:
 
 ## Ainda não implementado
 
-As rotas proxy antigas continuam disponíveis apenas para comparação; a interface usa exclusivamente a API v2, sem fallback. Cadastro e edição de partidas são as únicas escritas administrativas expostas. As rotas HTTP de reserva estão implementadas, mas desabilitadas por padrão; a interface não as chama e o fluxo de guardar credenciais antes do POST ainda não está implementado. Ainda não existem exclusão de partidas, votos, suporte a cancelamento de reservas, autenticação definitiva, cobrança ou confirmação de pagamento.
+As rotas proxy antigas continuam disponíveis apenas para comparação; a interface usa exclusivamente a API v2, sem fallback. Cadastro e edição de partidas são as únicas escritas administrativas expostas. As rotas HTTP de reserva e o envio pela interface estão implementados, mas desabilitados por padrão; não há integração com pagamento. Ainda não existem exclusão de partidas, votos, suporte a cancelamento de reservas, autenticação definitiva, cobrança ou confirmação de pagamento.
 
 ### Pendências antes de qualquer exposição pública
 
 Antes de qualquer exposição pública, revisar e implementar:
 
 - controles de borda distribuídos, limites por implantação e confiança explícita em proxies;
-- geração e armazenamento seguro, no navegador, das credenciais antes do POST para resistir a resposta perdida;
-- autorização e recuperação no cliente, com resposta mínima;
+- testes de navegador para criação, repetição incerta, recuperação, expiração, erros, privacidade e acessibilidade;
 - revisão de segurança das rotas e da política de expiração antes de conectar a interface.
 
 Esta entrega não migrou nem abriu o banco real e não autoriza exposição pública do bloqueio.
